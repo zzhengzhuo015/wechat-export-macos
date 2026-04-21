@@ -30,6 +30,7 @@ class CommandTests(unittest.TestCase):
                 "Foundation",
             ],
             check=True,
+            cwd=module_dir,
         )
 
     @patch("export_all_in_one.subprocess.run")
@@ -48,16 +49,20 @@ class CommandTests(unittest.TestCase):
         export_all_in_one.run_key_scan("./find_all_keys_macos")
         module_dir = os.path.dirname(os.path.abspath(export_all_in_one.__file__))
         expected_scanner = os.path.join(module_dir, "find_all_keys_macos")
-        mock_run.assert_called_once_with(["sudo", expected_scanner], check=True)
+        mock_run.assert_called_once_with(
+            ["sudo", expected_scanner], check=True, cwd=module_dir
+        )
 
     @patch("export_all_in_one.subprocess.run")
     def test_run_decrypt_uses_current_python_and_decrypt_script(self, mock_run):
         export_all_in_one.run_decrypt()
+        module_dir = os.path.dirname(os.path.abspath(export_all_in_one.__file__))
         expected_script = os.path.join(
-            os.path.dirname(os.path.abspath(export_all_in_one.__file__)),
-            "decrypt_db.py",
+            module_dir, "decrypt_db.py"
         )
-        mock_run.assert_called_once_with([sys.executable, expected_script], check=True)
+        mock_run.assert_called_once_with(
+            [sys.executable, expected_script], check=True, cwd=module_dir
+        )
 
 
 class MainTests(unittest.TestCase):
@@ -175,6 +180,46 @@ class MainTests(unittest.TestCase):
         mock_detect_owner_id.assert_not_called()
         mock_export_all_sessions.assert_not_called()
         mock_print.assert_not_called()
+
+    @patch("export_all_in_one.print")
+    @patch("export_all_in_one.export_all_sessions")
+    @patch("export_all_in_one.run_decrypt")
+    @patch("export_all_in_one.run_key_scan")
+    @patch("export_all_in_one.ensure_key_scanner")
+    @patch(
+        "export_all_in_one.load_config",
+        return_value={"decrypted_dir": "/config/decrypted"},
+    )
+    def test_main_fails_fast_when_decrypt_output_mismatches_config(
+        self,
+        mock_load_config,
+        mock_ensure_key_scanner,
+        mock_run_key_scan,
+        mock_run_decrypt,
+        mock_export_all_sessions,
+        mock_print,
+    ):
+        result = export_all_in_one.main(
+            [
+                "--output",
+                "/tmp/out",
+                "--decrypted-dir",
+                "/tmp/decrypted",
+                "--skip-scan",
+            ]
+        )
+
+        self.assertEqual(result, 2)
+        mock_load_config.assert_called_once_with()
+        mock_ensure_key_scanner.assert_not_called()
+        mock_run_key_scan.assert_not_called()
+        mock_run_decrypt.assert_not_called()
+        mock_export_all_sessions.assert_not_called()
+        mock_print.assert_called_once()
+        self.assertEqual(mock_print.call_args.kwargs.get("file"), sys.stderr)
+        self.assertIn("--decrypted-dir", mock_print.call_args.args[0])
+        self.assertIn("/tmp/decrypted", mock_print.call_args.args[0])
+        self.assertIn("/config/decrypted", mock_print.call_args.args[0])
 
 
 if __name__ == "__main__":

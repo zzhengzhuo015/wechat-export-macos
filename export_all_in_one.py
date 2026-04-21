@@ -7,10 +7,14 @@ from chat_export import export_all_sessions
 from config import load_config
 
 
+def _module_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def _module_path(path):
     if os.path.isabs(path):
         return path
-    base = os.path.dirname(os.path.abspath(__file__))
+    base = _module_dir()
     cleaned = path[2:] if path.startswith("./") else path
     return os.path.join(base, cleaned)
 
@@ -18,6 +22,7 @@ def _module_path(path):
 def ensure_key_scanner(scanner_path="./find_all_keys_macos"):
     scanner_path = _module_path(scanner_path)
     source_path = _module_path("find_all_keys_macos.c")
+    module_dir = _module_dir()
     if os.path.exists(scanner_path):
         return
     subprocess.run(
@@ -31,17 +36,19 @@ def ensure_key_scanner(scanner_path="./find_all_keys_macos"):
             "Foundation",
         ],
         check=True,
+        cwd=module_dir,
     )
 
 
 def run_key_scan(scanner_path="./find_all_keys_macos"):
     scanner_path = _module_path(scanner_path)
-    subprocess.run(["sudo", scanner_path], check=True)
+    subprocess.run(["sudo", scanner_path], check=True, cwd=_module_dir())
 
 
 def run_decrypt():
-    decrypt_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decrypt_db.py")
-    subprocess.run([sys.executable, decrypt_script], check=True)
+    module_dir = _module_dir()
+    decrypt_script = os.path.join(module_dir, "decrypt_db.py")
+    subprocess.run([sys.executable, decrypt_script], check=True, cwd=module_dir)
 
 
 def detect_owner_id():
@@ -68,7 +75,20 @@ def main(argv=None):
         decrypted_dir = args.decrypted_dir
     else:
         config = load_config()
-        decrypted_dir = args.decrypted_dir or config["decrypted_dir"]
+        configured_decrypted_dir = config["decrypted_dir"]
+        if (
+            not args.skip_decrypt
+            and args.decrypted_dir
+            and os.path.abspath(args.decrypted_dir) != os.path.abspath(configured_decrypted_dir)
+        ):
+            print(
+                "Error: --decrypted-dir "
+                f"({args.decrypted_dir}) does not match config decrypted_dir "
+                f"({configured_decrypted_dir}) while decryption is enabled.",
+                file=sys.stderr,
+            )
+            return 2
+        decrypted_dir = args.decrypted_dir or configured_decrypted_dir
 
     try:
         if not args.skip_scan:
