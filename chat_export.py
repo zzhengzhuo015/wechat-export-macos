@@ -4,10 +4,28 @@ import hashlib
 import json
 import os
 import sqlite3
+import csv
+from datetime import datetime, timezone, timedelta
 from time import time
 
 
 FORBIDDEN_FILENAME_CHARS = r'[<>:"/\\|?*\x00-\x1f]'
+CST = timezone(timedelta(hours=8))
+MSG_TYPES = {
+    1: "文本",
+    3: "图片",
+    34: "语音",
+    42: "名片",
+    43: "视频",
+    47: "表情",
+    48: "位置",
+    49: "链接/文件/小程序",
+    50: "语音/视频通话",
+    51: "系统消息",
+    10000: "系统提示",
+    10002: "撤回消息",
+}
+MEDIA_TYPES = {3, 34, 43, 47}
 
 
 def sanitize_filename(name):
@@ -79,6 +97,243 @@ def load_contacts(contact_db_path):
 def list_message_databases(decrypted_dir):
     pattern = os.path.join(decrypted_dir, "message", "message_*.db")
     return sorted(glob.glob(pattern))
+
+
+def list_export_message_databases(decrypted_dir):
+    msg_dir = os.path.join(decrypted_dir, "message")
+    dbs = []
+    if os.path.isdir(msg_dir):
+        for filename in sorted(os.listdir(msg_dir)):
+            if filename.startswith("message_") and filename.endswith(".db") and "fts" not in filename:
+                dbs.append(os.path.join(msg_dir, filename))
+    return dbs
+
+
+def resolve_contact_db_path(decrypted_dir):
+    contact_db = os.path.join(os.path.dirname(decrypted_dir), "decrypted", "contact", "contact.db")
+    if os.path.exists(contact_db):
+        return contact_db
+    return os.path.join(decrypted_dir, "contact", "contact.db")
+
+
+def find_contacts(contact_db_path, query):
+    conn = sqlite3.connect(contact_db_path)
+    try:
+        return conn.execute(
+            """
+            SELECT username, nick_name, remark, alias
+            FROM contact
+            WHERE nick_name LIKE ? OR remark LIKE ? OR alias LIKE ?
+            """,
+            (f"%{query}%", f"%{query}%", f"%{query}%"),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def lookup_username_display(contact_db_path, username):
+    conn = sqlite3.connect(contact_db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT username, nick_name, remark, alias
+            FROM contact
+            WHERE username = ?
+            LIMIT 1
+            """,
+            (username,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return username
+    _, nick_name, remark, alias = row
+    return remark or nick_name or alias or username
+
+
+def list_conversations_for_cli(decrypted_dir, contact_db_path, top_n=20, printer=print):
+    conversations = {}
+    for db_path in list_export_message_databases(decrypted_dir):
+        conn = sqlite3.connect(db_path)
+        try:
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+            ).fetchall()
+            for (table_name,) in tables:
+                try:
+                    row = conn.execute(
+                        f"""
+                        SELECT COUNT(*),
+                               datetime(MIN(create_time), 'unixepoch', 'localtime'),
+                               datetime(MAX(create_time), 'unixepoch', 'localtime')
+                        FROM {table_name} WHERE create_time > 0
+                        """
+                    ).fetchone()
+                    count, earliest, latest = row
+                    if count == 0:
+                        continue
+                    if table_name not in conversations:
+                        conversations[table_name] = {
+                            "count": 0,
+                            "earliest": earliest,
+                            "latest": latest,
+                        }
+                    conversations[table_name]["count"] += count
+                    if earliest and (
+                        not conversations[table_name]["earliest"]
+                        or earliest < conversations[table_name]["earliest"]
+                    ):
+                        conversations[table_name]["earliest"] = earliest
+                    if latest and (
+                        not conversations[table_name]["latest"]
+                        or latest > conversations[table_name]["latest"]
+                    ):
+                        conversations[table_name]["latest"] = latest
+                except sqlite3.DatabaseError:
+                    continue
+        finally:
+            conn.close()
+
+    contact_map = {}
+    try:
+        conn = sqlite3.connect(contact_db_path)
+        rows = conn.execute("SELECT username, nick_name, remark, alias FROM contact").fetchall()
+        for username, nick_name, remark, alias in rows:
+            table = session_table_for_username(username)
+            display = remark or nick_name or alias or username
+            contact_map[table] = (username, display)
+    except sqlite3.DatabaseError:
+        pass
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+    sorted_conversations = sorted(
+        conversations.items(),
+        key=lambda item: item[1]["count"],
+        reverse=True,
+    )
+
+    printer(f"\n{'排名':<4} {'消息数':<8} {'时间范围':<45} {'显示名':<20} {'用户名'}")
+    printer("-" * 120)
+    for index, (table_name, info) in enumerate(sorted_conversations[:top_n], 1):
+        if table_name in contact_map:
+            username, display = contact_map[table_name]
+        else:
+            username = table_name
+            display = "(?)"
+        time_range = f"{info['earliest']} ~ {info['latest']}"
+        printer(f"{index:<4} {info['count']:<8} {time_range:<45} {display:<20} {username}")
+
+    printer(f"\n共 {len(conversations)} 个会话")
+    return sorted_conversations
+
+
+def export_single_session(
+    decrypted_dir,
+    contact_username,
+    contact_display_name,
+    output_dir,
+    contact_db_path=None,
+    owner_id="",
+    printer=print,
+):
+    table_name = session_table_for_username(contact_username)
+    os.makedirs(output_dir, exist_ok=True)
+    all_messages = []
+
+    for db_path in list_export_message_databases(decrypted_dir):
+        conn = sqlite3.connect(db_path)
+        db_name = os.path.basename(db_path)
+        try:
+            name2id = {}
+            for rowid, user_name in conn.execute("SELECT rowid, user_name FROM Name2Id"):
+                name2id[rowid] = user_name
+
+            rows = conn.execute(
+                f"""
+                SELECT local_id, server_id, local_type, create_time,
+                       real_sender_id, message_content, source,
+                       WCDB_CT_message_content
+                FROM {table_name}
+                ORDER BY create_time ASC
+                """
+            ).fetchall()
+
+            for row in rows:
+                sender_wxid = name2id.get(row[4], "")
+                if owner_id and sender_wxid == owner_id:
+                    sender = "我"
+                elif row[2] in (10000, 10002):
+                    sender = "系统"
+                else:
+                    sender = contact_display_name
+
+                content = row[5] or ""
+                if isinstance(content, bytes):
+                    content = "[压缩内容]"
+
+                all_messages.append(
+                    {
+                        "time": datetime.fromtimestamp(row[3], tz=CST).strftime("%Y-%m-%d %H:%M:%S")
+                        if row[3]
+                        else "",
+                        "timestamp": row[3],
+                        "sender": sender,
+                        "type": row[2],
+                        "type_name": MSG_TYPES.get(row[2], f"未知({row[2]})"),
+                        "content": content,
+                        "server_id": row[1],
+                        "db": db_name,
+                    }
+                )
+
+            if rows:
+                printer(f"  {db_name}: {len(rows)} 条消息")
+        except sqlite3.DatabaseError:
+            pass
+        finally:
+            conn.close()
+
+    all_messages.sort(key=lambda item: item["timestamp"] or 0)
+    if not all_messages:
+        printer(f"未找到与 {contact_display_name} 的聊天记录")
+        return 0
+
+    txt_path = os.path.join(output_dir, "chat.txt")
+    with open(txt_path, "w", encoding="utf-8") as file_handle:
+        file_handle.write(f"微信聊天记录: {contact_display_name} ({contact_username})\n")
+        file_handle.write(f"总消息数: {len(all_messages)}\n")
+        file_handle.write(f"时间范围: {all_messages[0]['time']} ~ {all_messages[-1]['time']}\n")
+        file_handle.write("=" * 60 + "\n\n")
+        for message in all_messages:
+            content = message["content"]
+            if message["type"] in MEDIA_TYPES:
+                content = f"[{message['type_name']}]"
+            elif message["type"] != 1 and not content:
+                content = f"[{message['type_name']}]"
+            file_handle.write(f"[{message['time']}] {message['sender']}: {content}\n")
+    printer(f"  TXT: {txt_path}")
+
+    csv_path = os.path.join(output_dir, "chat.csv")
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as file_handle:
+        writer = csv.writer(file_handle)
+        writer.writerow(["时间", "发送者", "类型", "内容"])
+        for message in all_messages:
+            content = message["content"]
+            if message["type"] in MEDIA_TYPES:
+                content = f"[{message['type_name']}]"
+            elif message["type"] != 1 and not content:
+                content = f"[{message['type_name']}]"
+            writer.writerow([message["time"], message["sender"], message["type_name"], content])
+    printer(f"  CSV: {csv_path}")
+
+    json_path = os.path.join(output_dir, "chat.json")
+    with open(json_path, "w", encoding="utf-8") as file_handle:
+        json.dump(all_messages, file_handle, ensure_ascii=False, indent=2)
+    printer(f"  JSON: {json_path}")
+    printer(f"\n导出完成: {len(all_messages)} 条消息")
+    return len(all_messages)
 
 
 def table_exists(conn, table_name):
