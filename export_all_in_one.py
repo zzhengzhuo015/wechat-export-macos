@@ -42,7 +42,13 @@ def ensure_key_scanner(scanner_path="./find_all_keys_macos"):
 
 def run_key_scan(scanner_path="./find_all_keys_macos"):
     scanner_path = _module_path(scanner_path)
-    subprocess.run(["sudo", scanner_path], check=True, cwd=_module_dir())
+    subprocess.run(
+        ["sudo", scanner_path],
+        check=True,
+        cwd=_module_dir(),
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def run_decrypt():

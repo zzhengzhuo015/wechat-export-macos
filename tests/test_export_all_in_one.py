@@ -50,7 +50,11 @@ class CommandTests(unittest.TestCase):
         module_dir = os.path.dirname(os.path.abspath(export_all_in_one.__file__))
         expected_scanner = os.path.join(module_dir, "find_all_keys_macos")
         mock_run.assert_called_once_with(
-            ["sudo", expected_scanner], check=True, cwd=module_dir
+            ["sudo", expected_scanner],
+            check=True,
+            cwd=module_dir,
+            stderr=subprocess.PIPE,
+            text=True,
         )
 
     @patch("export_all_in_one.subprocess.run")
