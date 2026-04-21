@@ -77,7 +77,19 @@ python3 export_chat.py --username wxid_xxxxx --output ~/Downloads/output
 python3 export_chat.py --name "张三" --my-wxid wxid_xxxxx --output ~/Downloads/张三
 ```
 
-导出文件：
+### 一键导出全部会话（Chatlab JSON）
+
+```bash
+python3 export_all_in_one.py --output ~/Downloads/wechat-export
+```
+
+- 输出目录中每个会话对应一个 JSON 文件
+- JSON 结构与 Chatlab 风格示例一致（`chatlab` / `meta` / `members` / `messages`）
+- 文件名优先使用联系人或群名称；同名冲突时自动追加 `-2`、`-3` 等后缀
+
+### 传统单会话导出（`export_chat.py`）输出文件
+
+当使用 `python3 export_chat.py --name ...` 或 `--username ...` 导出单个会话时，会生成：
 - `chat.txt` — 纯文本，可直接阅读
 - `chat.csv` — 表格格式，可用 Excel/Numbers 打开
 - `chat.json` — 结构化 JSON，适合编程分析
