@@ -157,9 +157,54 @@ def _auto_detect_db_dir_linux():
     return _choose_candidate(candidates)
 
 
+def _auto_detect_db_dir_darwin():
+    """自动检测 macOS 微信 db_storage 路径。"""
+    seen = set()
+    candidates = []
+    search_roots = [
+        os.path.expanduser("~/Documents/xwechat_files"),
+    ]
+
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        import pwd
+
+        try:
+            sudo_home = pwd.getpwnam(sudo_user).pw_dir
+        except KeyError:
+            sudo_home = None
+        if sudo_home:
+            fallback = os.path.join(sudo_home, "Documents", "xwechat_files")
+            if fallback not in search_roots:
+                search_roots.append(fallback)
+
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        pattern = os.path.join(root, "*", "db_storage")
+        for match in glob.glob(pattern):
+            normalized = os.path.normcase(os.path.normpath(match))
+            if os.path.isdir(match) and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(match)
+
+    def _mtime(path):
+        msg_dir = os.path.join(path, "message")
+        target = msg_dir if os.path.isdir(msg_dir) else path
+        try:
+            return os.path.getmtime(target)
+        except OSError:
+            return 0
+
+    candidates.sort(key=_mtime, reverse=True)
+    return _choose_candidate(candidates)
+
+
 def auto_detect_db_dir():
     if _SYSTEM == "windows":
         return _auto_detect_db_dir_windows()
+    if _SYSTEM == "darwin":
+        return _auto_detect_db_dir_darwin()
     if _SYSTEM == "linux":
         return _auto_detect_db_dir_linux()
     return None
