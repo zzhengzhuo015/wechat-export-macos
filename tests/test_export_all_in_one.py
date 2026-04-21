@@ -181,6 +181,61 @@ class MainTests(unittest.TestCase):
         mock_export_all_sessions.assert_not_called()
         mock_print.assert_not_called()
 
+    @patch("export_all_in_one.os.path.exists", return_value=True)
+    @patch("export_all_in_one.print")
+    @patch("export_all_in_one.export_all_sessions")
+    @patch("export_all_in_one.detect_owner_id", return_value="wxid_owner")
+    @patch("export_all_in_one.run_decrypt")
+    @patch(
+        "export_all_in_one.run_key_scan",
+        side_effect=subprocess.CalledProcessError(
+            1,
+            ["sudo", "scanner"],
+            stderr="WeChat not running or invalid PID\n",
+        ),
+    )
+    @patch("export_all_in_one.ensure_key_scanner")
+    @patch(
+        "export_all_in_one.load_config",
+        return_value={
+            "decrypted_dir": "/config/decrypted",
+            "keys_file": "/config/all_keys.json",
+        },
+    )
+    def test_main_reuses_existing_keys_when_scan_fails_due_to_missing_pid(
+        self,
+        mock_load_config,
+        mock_ensure_key_scanner,
+        mock_run_key_scan,
+        mock_run_decrypt,
+        mock_detect_owner_id,
+        mock_export_all_sessions,
+        mock_print,
+        mock_exists,
+    ):
+        mock_export_all_sessions.return_value = {"success_count": 1, "failed_count": 0}
+
+        result = export_all_in_one.main(["--output", "/tmp/out"])
+
+        self.assertEqual(result, 0)
+        mock_load_config.assert_called_once_with()
+        mock_ensure_key_scanner.assert_called_once_with()
+        mock_run_key_scan.assert_called_once_with()
+        mock_exists.assert_any_call("/config/all_keys.json")
+        mock_run_decrypt.assert_called_once_with()
+        mock_detect_owner_id.assert_called_once_with()
+        mock_export_all_sessions.assert_called_once_with(
+            decrypted_dir="/config/decrypted",
+            output_dir="/tmp/out",
+            owner_id="wxid_owner",
+        )
+        self.assertEqual(mock_print.call_count, 2)
+        self.assertIn("existing key file", mock_print.call_args_list[0].args[0])
+        self.assertEqual(
+            mock_print.call_args_list[1].args[0],
+            "Export finished: success_count=1 failed_count=0 output=/tmp/out",
+        )
+
     @patch("export_all_in_one.print")
     @patch("export_all_in_one.export_all_sessions")
     @patch("export_all_in_one.run_decrypt")

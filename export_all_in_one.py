@@ -62,6 +62,13 @@ def detect_owner_id():
         return ""
 
 
+def can_reuse_existing_keys(scan_error, keys_file):
+    if not keys_file or not os.path.exists(keys_file):
+        return False
+    stderr = getattr(scan_error, "stderr", "") or ""
+    return "WeChat not running or invalid PID" in stderr
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="One-click WeChat export")
     parser.add_argument("--output", required=True)
@@ -76,6 +83,7 @@ def main(argv=None):
     else:
         config = load_config()
         configured_decrypted_dir = config["decrypted_dir"]
+        keys_file = config.get("keys_file")
         if (
             not args.skip_decrypt
             and args.decrypted_dir
@@ -89,11 +97,22 @@ def main(argv=None):
             )
             return 2
         decrypted_dir = args.decrypted_dir or configured_decrypted_dir
+    if args.decrypted_dir and args.skip_scan and args.skip_decrypt:
+        keys_file = None
 
     try:
         if not args.skip_scan:
             ensure_key_scanner()
-            run_key_scan()
+            try:
+                run_key_scan()
+            except subprocess.CalledProcessError as exc:
+                if can_reuse_existing_keys(exc, keys_file):
+                    print(
+                        "Key scan failed because WeChat PID was unavailable; "
+                        f"reusing existing key file: {keys_file}"
+                    )
+                else:
+                    raise
         if not args.skip_decrypt:
             run_decrypt()
     except subprocess.CalledProcessError:
