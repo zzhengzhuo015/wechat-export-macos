@@ -163,6 +163,9 @@ def _auto_detect_db_dir_darwin():
     candidates = []
     search_roots = [
         os.path.expanduser("~/Documents/xwechat_files"),
+        os.path.expanduser(
+            "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
+        ),
     ]
 
     sudo_user = os.environ.get("SUDO_USER")
@@ -174,9 +177,20 @@ def _auto_detect_db_dir_darwin():
         except KeyError:
             sudo_home = None
         if sudo_home:
-            fallback = os.path.join(sudo_home, "Documents", "xwechat_files")
-            if fallback not in search_roots:
-                search_roots.append(fallback)
+            for fallback in (
+                os.path.join(sudo_home, "Documents", "xwechat_files"),
+                os.path.join(
+                    sudo_home,
+                    "Library",
+                    "Containers",
+                    "com.tencent.xinWeChat",
+                    "Data",
+                    "Documents",
+                    "xwechat_files",
+                ),
+            ):
+                if fallback not in search_roots:
+                    search_roots.append(fallback)
 
     for root in search_roots:
         if not os.path.isdir(root):
