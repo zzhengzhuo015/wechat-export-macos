@@ -53,11 +53,17 @@ sudo ./find_all_keys_macos
 ### 第四步：安装 Python 依赖 & 解密
 
 ```bash
-pip3 install pycryptodome
+pip3 install -r requirements.txt
 
 # 首次运行会自动检测微信数据目录并生成 config.json
 python3 decrypt_db.py
 ```
+
+`requirements.txt` 当前包含：
+
+- `pycryptodome`：数据库解密
+- `Pillow`：图片内容识别与重编码，统一导出为 `jpg` / `png` / `gif`
+- `silk-python`：将微信语音 Silk 数据解码并导出为 `wav`
 
 解密后的数据库在 `./decrypted/` 目录下。
 
@@ -86,6 +92,9 @@ python3 export_all_in_one.py --output ~/Downloads/wechat-export
 - 输出目录中每个会话对应一个 JSON 文件
 - JSON 结构与 Chatlab 风格示例一致（`chatlab` / `meta` / `members` / `messages`）
 - 文件名优先使用联系人或群名称；同名冲突时自动追加 `-2`、`-3` 等后缀
+- 图片消息和音频消息会额外导出到输出目录下的 `images/`、`audio/` 子目录
+- 对应消息的 JSON 会写入相对路径字段 `file_path`
+- 媒体会按内容规范化导出：普通照片 -> `jpg`，静态透明图/贴纸类图片 -> `png`，动画图片 -> `gif`，语音 -> `wav`
 
 ### 传统单会话导出（`export_chat.py`）输出文件
 
@@ -93,6 +102,15 @@ python3 export_all_in_one.py --output ~/Downloads/wechat-export
 - `chat.txt` — 纯文本，可直接阅读
 - `chat.csv` — 表格格式，可用 Excel/Numbers 打开
 - `chat.json` — 结构化 JSON，适合编程分析
+- `images/` — 当前会话中导出的图片文件
+- `audio/` — 当前会话中导出的音频文件
+
+其中 `chat.json` 里的图片/音频消息会包含相对导出目录的 `file_path` 字段。导出后的媒体后缀会按内容统一：
+
+- 普通照片 -> `images/<session_hash>/xxx.jpg`
+- 静态透明图、表情包、贴纸类图片 -> `images/<session_hash>/xxx.png`
+- 动画图片 -> `images/<session_hash>/xxx.gif`
+- 语音 -> `audio/<session_hash>/xxx.wav`
 
 ## 聊天记录迁移提示
 
@@ -146,7 +164,7 @@ decrypted/
 微信 WCDB 对部分消息内容使用了 zstd 压缩（`WCDB_CT_message_content=4`），需要额外解压。大部分文本消息不受影响。
 
 **Q: 图片/视频/语音怎么导出？**
-本工具目前导出文本记录。图片等媒体文件存储在微信的文件目录中（`xwechat_files/.../Message/`），需要通过 `message_resource.db` 关联路径提取，后续版本可能支持。
+图片消息和音频消息会导出到输出目录下的 `images/`、`audio/` 子目录，并在对应 JSON 消息中写入 `file_path`。图片会按内容统一为 `jpg` / `png` / `gif`，语音会统一为 `wav`。如果某条媒体消息找不到源文件、图片无法解码，或语音转码失败，导出不会中断，但该消息的 `file_path` 会为空字符串。视频/其他媒体类型目前仍以消息记录为主，不保证导出文件本体。
 
 **Q: 支持群聊吗？**
 支持。群聊的表名是 `Msg_<md5(chatroom_id)>`，导出方式相同。群聊中会显示每个发言者的 wxid（后续可关联到昵称）。
