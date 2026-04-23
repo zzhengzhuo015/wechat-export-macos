@@ -3,10 +3,15 @@ import glob
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import csv
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from time import time
+
+from config import load_config
+from media_conversion import try_convert_image_bytes, try_convert_silk_bytes_to_wav
 
 
 FORBIDDEN_FILENAME_CHARS = r'[<>:"/\\|?*\x00-\x1f]'
@@ -26,6 +31,11 @@ MSG_TYPES = {
     10002: "撤回消息",
 }
 MEDIA_TYPES = {3, 34, 43, 47}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".dat"}
+UNSUPPORTED_IMAGE_EXTENSIONS = {".heic", ".heif"}
+AUDIO_EXTENSIONS = {".silk", ".amr", ".aac", ".m4a", ".wav", ".mp3", ".opus"}
+IMAGE_DIR_HINTS = ("img", "image", "thumb")
+AUDIO_DIR_HINTS = ("audio", "voice", "record", "sound")
 
 
 def sanitize_filename(name):
@@ -74,6 +84,12 @@ def build_chatlab_payload(
 
 def session_table_for_username(username):
     return f"Msg_{hashlib.md5(username.encode('utf-8')).hexdigest()}"
+
+
+def session_hash_for_username(username):
+    if re.fullmatch(r"Msg_[0-9a-f]{32}", username or ""):
+        return username[4:]
+    return session_table_for_username(username)[4:]
 
 
 def load_contacts(contact_db_path):
@@ -149,6 +165,333 @@ def lookup_username_display(contact_db_path, username):
         return username
     _, nick_name, remark, alias = row
     return remark or nick_name or alias or username
+
+
+def _resolve_data_root(decrypted_dir):
+    decrypted_path = Path(decrypted_dir)
+    fallback_root = decrypted_path.parent if decrypted_path.name == "decrypted" else decrypted_path.parent
+    if (fallback_root / "msg" / "attach").exists() or (fallback_root / "cache").exists():
+        return fallback_root
+
+    try:
+        cfg = load_config()
+    except (OSError, KeyError, SystemExit, ValueError):
+        cfg = {}
+
+    configured_base = cfg.get("wechat_base_dir")
+    if configured_base:
+        configured_path = Path(configured_base)
+        if (configured_path / "msg" / "attach").exists() or (configured_path / "cache").exists():
+            return configured_path
+
+    return fallback_root
+
+
+def _load_message_resource_tokens(decrypted_dir):
+    db_path = Path(decrypted_dir) / "message" / "message_resource.db"
+    tokens_by_message = {}
+    if not db_path.exists():
+        return tokens_by_message
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            """
+            SELECT message_local_id, message_create_time, packed_info
+            FROM MessageResourceInfo
+            """
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        conn.close()
+        return tokens_by_message
+    finally:
+        conn.close()
+
+    for local_id, create_time, packed_info in rows:
+        tokens = _extract_hex_tokens(packed_info)
+        if not tokens:
+            continue
+        key = (local_id or 0, create_time or 0)
+        tokens_by_message.setdefault(key, set()).update(tokens)
+    return tokens_by_message
+
+
+def _load_voice_blobs(decrypted_dir):
+    db_path = Path(decrypted_dir) / "message" / "media_0.db"
+    voice_blobs = {}
+    if not db_path.exists():
+        return voice_blobs
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            """
+            SELECT n.user_name, v.create_time, v.local_id, v.svr_id, v.voice_data
+            FROM VoiceInfo v
+            JOIN Name2Id n ON n.rowid = v.chat_name_id
+            WHERE length(v.voice_data) > 0
+            """
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        conn.close()
+        return voice_blobs
+    finally:
+        conn.close()
+
+    for username, create_time, local_id, svr_id, voice_data in rows:
+        voice_blobs[(username, local_id or 0, create_time or 0, str(svr_id or ""))] = voice_data
+    return voice_blobs
+
+
+def build_media_export_context(decrypted_dir):
+    data_root = _resolve_data_root(decrypted_dir)
+    return {
+        "attach_root": data_root / "msg" / "attach",
+        "cache_root": data_root / "cache",
+        "resource_tokens": _load_message_resource_tokens(decrypted_dir),
+        "voice_blobs": _load_voice_blobs(decrypted_dir),
+        "session_files": {},
+        "exported_paths": {},
+    }
+
+
+def _extract_hex_tokens(raw_value):
+    if raw_value is None:
+        return set()
+    if isinstance(raw_value, bytes):
+        text = raw_value.decode("latin1", errors="ignore")
+    else:
+        text = str(raw_value)
+    return set(re.findall(r"[0-9a-f]{32}", text.lower()))
+
+
+def _normalized_local_type(local_type):
+    if local_type is None:
+        return 0
+    if local_type > 0xFFFFFFFF:
+        return local_type & 0xFFFFFFFF
+    return local_type
+
+
+def _media_kind_from_type(local_type):
+    normalized = _normalized_local_type(local_type)
+    if normalized == 3 or local_type == 3:
+        return "images"
+    if normalized == 34 or local_type == 34:
+        return "audio"
+    return None
+
+
+def _infer_media_kind_from_path(file_path):
+    suffix = file_path.suffix.lower()
+    if suffix in UNSUPPORTED_IMAGE_EXTENSIONS:
+        return None
+    if suffix in AUDIO_EXTENSIONS:
+        return "audio"
+    if suffix in IMAGE_EXTENSIONS:
+        return "images"
+
+    path_parts = [part.lower() for part in file_path.parts[:-1]]
+    part_tokens = {token for part in path_parts for token in re.split(r"[_\-\s.]+", part) if token}
+    if any(hint in part_tokens for hint in AUDIO_DIR_HINTS):
+        return "audio"
+    if any(hint in part_tokens for hint in IMAGE_DIR_HINTS):
+        return "images"
+
+    suffix = file_path.suffix.lower()
+    return None
+
+
+def _list_session_media_files(media_context, session_hash):
+    cached = media_context["session_files"].get(session_hash)
+    if cached is not None:
+        return cached
+
+    files = []
+    attach_dir = media_context["attach_root"] / session_hash
+    if attach_dir.exists():
+        for path in attach_dir.rglob("*"):
+            if path.is_file():
+                files.append(path)
+
+    cache_root = media_context["cache_root"]
+    if cache_root.exists():
+        for path in cache_root.glob(f"*/Message/{session_hash}/**/*"):
+            if path.is_file():
+                files.append(path)
+
+    media_context["session_files"][session_hash] = files
+    return files
+
+
+def _candidate_match_score(file_path, expected_kind, local_id, resource_tokens):
+    if file_path.suffix.lower() in UNSUPPORTED_IMAGE_EXTENSIONS:
+        return None
+
+    name = file_path.name.lower()
+    path_parts = [part.lower() for part in file_path.parts]
+    inferred_kind = _infer_media_kind_from_path(file_path)
+    if expected_kind and inferred_kind and inferred_kind != expected_kind:
+        return None
+
+    token_match = any(token in name for token in resource_tokens)
+    prefix_match = name.startswith(f"{local_id}_")
+    if not prefix_match and not token_match:
+        return None
+
+    score = 0
+    if prefix_match:
+        score += 100
+    if token_match:
+        score += 80
+    if inferred_kind == expected_kind:
+        score += 40
+    if expected_kind == "images":
+        if "img" in path_parts or "image" in path_parts:
+            score += 20
+        if "_t.dat" in name or "_thumb." in name or "thumb" in path_parts:
+            score -= 10
+    if expected_kind == "audio":
+        if any(hint in path_parts for hint in AUDIO_DIR_HINTS):
+            score += 20
+    return score
+
+
+def _find_media_source(media_context, session_username, local_id, create_time, local_type):
+    session_hash = session_hash_for_username(session_username)
+    expected_kind = _media_kind_from_type(local_type)
+    resource_tokens = media_context["resource_tokens"].get((local_id or 0, create_time or 0), set())
+    session_files = _list_session_media_files(media_context, session_hash)
+
+    best_match = None
+    best_score = None
+    for file_path in session_files:
+        score = _candidate_match_score(file_path, expected_kind, local_id, resource_tokens)
+        if score is None:
+            continue
+        if best_score is None or score > best_score:
+            best_match = file_path
+            best_score = score
+
+    if best_match is None:
+        return None, expected_kind
+    return best_match, expected_kind or _infer_media_kind_from_path(best_match)
+
+
+def _build_export_basename(local_id, create_time, source_path):
+    basename = source_path.name
+    prefix = f"{local_id}_{create_time}"
+    if basename.startswith(f"{local_id}_"):
+        return basename
+    return f"{prefix}_{basename}"
+
+
+def _write_normalized_image(output_dir, media_kind, session_hash, local_id, create_time, source_path):
+    converted = try_convert_image_bytes(source_path.name, source_path.read_bytes())
+    if converted is None:
+        return ""
+
+    file_name, payload = converted
+    relative_path = Path(media_kind) / session_hash / f"{local_id}_{create_time}{Path(file_name).suffix}"
+    destination = Path(output_dir) / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(payload)
+    return relative_path.as_posix()
+
+
+def _write_wav_bytes(output_dir, session_hash, local_id, create_time, silk_bytes):
+    wav_bytes = try_convert_silk_bytes_to_wav(silk_bytes, sample_rate=24000)
+    if wav_bytes is None:
+        return ""
+
+    relative_path = Path("audio") / session_hash / f"{local_id}_{create_time}.wav"
+    destination = Path(output_dir) / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(wav_bytes)
+    return relative_path.as_posix()
+
+
+def _lookup_voice_blob(media_context, session_username, local_id, create_time, server_id=""):
+    voice_blob = media_context["voice_blobs"].get(
+        (session_username, local_id or 0, create_time or 0, str(server_id or ""))
+    )
+    if not voice_blob:
+        voice_blob = media_context["voice_blobs"].get(
+            (session_username, local_id or 0, create_time or 0, "")
+        )
+    return voice_blob
+
+
+def export_media_file(
+    media_context,
+    session_username,
+    output_dir,
+    local_id,
+    create_time,
+    local_type,
+    server_id="",
+):
+    source_path, media_kind = _find_media_source(
+        media_context=media_context,
+        session_username=session_username,
+        local_id=local_id,
+        create_time=create_time,
+        local_type=local_type,
+    )
+    if source_path is None or not media_kind:
+        if media_kind != "audio":
+            return ""
+
+        voice_blob = _lookup_voice_blob(
+            media_context, session_username, local_id, create_time, server_id
+        )
+        if not voice_blob:
+            return ""
+
+        session_hash = session_hash_for_username(session_username)
+        return _write_wav_bytes(output_dir, session_hash, local_id, create_time, voice_blob)
+
+    session_hash = session_hash_for_username(session_username)
+    if media_kind == "images":
+        return _write_normalized_image(
+            output_dir=output_dir,
+            media_kind=media_kind,
+            session_hash=session_hash,
+            local_id=local_id,
+            create_time=create_time,
+            source_path=source_path,
+        )
+
+    if media_kind == "audio":
+        file_path = _write_wav_bytes(output_dir, session_hash, local_id, create_time, source_path.read_bytes())
+        if file_path:
+            return file_path
+
+        voice_blob = _lookup_voice_blob(
+            media_context, session_username, local_id, create_time, server_id
+        )
+        if not voice_blob:
+            return ""
+        return _write_wav_bytes(output_dir, session_hash, local_id, create_time, voice_blob)
+
+    basename = _build_export_basename(local_id, create_time, source_path)
+    relative_path = Path(media_kind) / session_hash / basename
+    destination = Path(output_dir) / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    cache_key = str(relative_path)
+    if cache_key not in media_context["exported_paths"]:
+        shutil.copy2(source_path, destination)
+        media_context["exported_paths"][cache_key] = str(source_path)
+    return relative_path.as_posix()
+
+
+def _strip_internal_message_fields(message):
+    return {
+        key: value
+        for key, value in message.items()
+        if not key.startswith("_")
+    }
 
 
 def list_conversations_for_cli(decrypted_dir, contact_db_path, top_n=20, printer=print):
@@ -241,6 +584,7 @@ def export_single_session(
     table_name = session_table_for_username(contact_username)
     os.makedirs(output_dir, exist_ok=True)
     all_messages = []
+    media_context = build_media_export_context(decrypted_dir)
 
     for db_path in list_export_message_databases(decrypted_dir):
         conn = sqlite3.connect(db_path)
@@ -275,6 +619,9 @@ def export_single_session(
 
                 all_messages.append(
                     {
+                        "_local_id": row[0],
+                        "_raw_type": row[2],
+                        "_server_id": str(row[1] or ""),
                         "time": datetime.fromtimestamp(row[3], tz=CST).strftime("%Y-%m-%d %H:%M:%S")
                         if row[3]
                         else "",
@@ -299,6 +646,18 @@ def export_single_session(
     if not all_messages:
         printer(f"未找到与 {contact_display_name} 的聊天记录")
         return 0
+
+    for message in all_messages:
+        if message["_raw_type"] != 1:
+            message["file_path"] = export_media_file(
+                media_context=media_context,
+                session_username=contact_username,
+                output_dir=output_dir,
+                local_id=message["_local_id"],
+                create_time=message["timestamp"] or 0,
+                local_type=message["_raw_type"],
+                server_id=message["_server_id"],
+            )
 
     txt_path = os.path.join(output_dir, "chat.txt")
     with open(txt_path, "w", encoding="utf-8") as file_handle:
@@ -330,7 +689,12 @@ def export_single_session(
 
     json_path = os.path.join(output_dir, "chat.json")
     with open(json_path, "w", encoding="utf-8") as file_handle:
-        json.dump(all_messages, file_handle, ensure_ascii=False, indent=2)
+        json.dump(
+            [_strip_internal_message_fields(message) for message in all_messages],
+            file_handle,
+            ensure_ascii=False,
+            indent=2,
+        )
     printer(f"  JSON: {json_path}")
     printer(f"\n导出完成: {len(all_messages)} 条消息")
     return len(all_messages)
@@ -389,6 +753,9 @@ def normalize_message(row, name2id, contacts):
         content = str(message_content)
     platform_message_id = server_id if server_id else local_id
     return {
+        "_local_id": local_id or 0,
+        "_raw_type": local_type or 0,
+        "_server_id": str(server_id or ""),
         "sender": sender_wxid,
         "accountName": sender_name,
         "timestamp": create_time or 0,
@@ -436,6 +803,7 @@ def export_all_sessions(decrypted_dir, output_dir, owner_id=""):
         "failed_count": 0,
         "files": [],
     }
+    media_context = build_media_export_context(decrypted_dir)
 
     sessions = {}
     for username, contact_info in contacts.items():
@@ -480,6 +848,17 @@ def export_all_sessions(decrypted_dir, output_dir, owner_id=""):
         merged_messages.sort(
             key=lambda item: (item.get("timestamp", 0), item.get("platformMessageId", ""))
         )
+        for message in merged_messages:
+            if message.get("_raw_type", 0) != 1:
+                message["file_path"] = export_media_file(
+                    media_context=media_context,
+                    session_username=session_id,
+                    output_dir=output_dir,
+                    local_id=message.get("_local_id", 0),
+                    create_time=message.get("timestamp", 0),
+                    local_type=message.get("_raw_type", 0),
+                    server_id=message.get("_server_id", ""),
+                )
         display_name = session_info["display"]
         session_type = "group" if session_id.endswith("@chatroom") else "direct"
         members = build_members(
@@ -496,7 +875,7 @@ def export_all_sessions(decrypted_dir, output_dir, owner_id=""):
             session_type=session_type,
             owner_id=owner_id or "",
             members=members,
-            messages=merged_messages,
+            messages=[_strip_internal_message_fields(message) for message in merged_messages],
         )
 
         filename = dedupe_filename(display_name, used_names)
