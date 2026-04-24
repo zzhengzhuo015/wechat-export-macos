@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 
@@ -189,6 +190,39 @@ class SingleSessionMediaExportTests(unittest.TestCase):
         image.save(output, format=image_format)
         return output.getvalue()
 
+    def _make_wav_bytes(self):
+        output = io.BytesIO()
+        with wave.open(output, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(24000)
+            wav_file.writeframes(b"\x00\x00" * 8)
+        return output.getvalue()
+
+    def _make_v2_dat_bytes(self, image_bytes, aes_key, xor_key):
+        from Crypto.Cipher import AES
+        from Crypto.Util import Padding
+
+        aes_size = 16
+        xor_size = 2
+        aes_plain = image_bytes[:aes_size]
+        raw_middle = image_bytes[aes_size:-xor_size]
+        xor_tail = image_bytes[-xor_size:]
+
+        aes_cipher = AES.new(aes_key[:16], AES.MODE_ECB)
+        aes_encrypted = aes_cipher.encrypt(Padding.pad(aes_plain, AES.block_size))
+        xor_encrypted = bytes(value ^ xor_key for value in xor_tail)
+        dat_bytes = (
+            b"\x07\x08V2\x08\x07"
+            + aes_size.to_bytes(4, "little")
+            + xor_size.to_bytes(4, "little")
+            + b"\x01"
+            + aes_encrypted
+            + raw_middle
+            + xor_encrypted
+        )
+        return aes_encrypted[:16].hex(), dat_bytes
+
     def test_export_single_session_normalizes_image_and_audio_paths(self):
         with patch("chat_export.try_convert_silk_bytes_to_wav", return_value=b"RIFFmock-wav", create=True):
             exported_count = export_single_session(
@@ -241,8 +275,9 @@ class SingleSessionMediaExportTests(unittest.TestCase):
         self.assertEqual(payload[1]["file_path"], f"audio/{self.session_hash}/2_1722858001.wav")
         self.assertTrue((self.output_dir / payload[1]["file_path"]).exists())
 
-    def test_export_single_session_returns_empty_path_when_image_conversion_fails(self):
-        with patch("chat_export.try_convert_image_bytes", return_value=None, create=True), patch(
+    def test_export_single_session_falls_back_to_raw_image_when_conversion_fails(self):
+        raw_bytes = (self.base / "msg" / "attach" / self.session_hash / "2024-08" / "Img" / "1_1722858000.dat").read_bytes()
+        with patch("chat_export.try_convert_image_file", return_value=None, create=True), patch(
             "chat_export.try_convert_silk_bytes_to_wav",
             return_value=b"RIFFmock-wav",
             create=True,
@@ -257,7 +292,8 @@ class SingleSessionMediaExportTests(unittest.TestCase):
             )
 
         payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
-        self.assertEqual(payload[0]["file_path"], "")
+        self.assertEqual(payload[0]["file_path"], f"images/{self.session_hash}/1_1722858000.dat")
+        self.assertEqual((self.output_dir / payload[0]["file_path"]).read_bytes(), raw_bytes)
 
     def test_export_single_session_exports_voice_blob_from_media_db(self):
         original_media_root = self.base / "msg"
@@ -341,7 +377,70 @@ class SingleSessionMediaExportTests(unittest.TestCase):
             )
 
         payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
-        self.assertEqual(payload[1]["file_path"], "")
+        self.assertEqual(payload[1]["file_path"], f"audio/{self.session_hash}/2_1722858001.silk")
+
+    def test_export_single_session_falls_back_to_raw_audio_when_conversion_fails(self):
+        raw_audio = (self.base / "msg" / "attach" / self.session_hash / "2024-08" / "Audio" / "2_1722858001.silk").read_bytes()
+        with patch("chat_export.try_convert_silk_bytes_to_wav", return_value=None, create=True):
+            export_single_session(
+                decrypted_dir=str(self.decrypted_dir),
+                contact_username=self.contact_username,
+                contact_display_name="好友",
+                output_dir=str(self.output_dir),
+                owner_id="wxid_owner",
+                printer=lambda *_args, **_kwargs: None,
+            )
+
+        payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload[1]["file_path"], f"audio/{self.session_hash}/2_1722858001.silk")
+        self.assertEqual((self.output_dir / payload[1]["file_path"]).read_bytes(), raw_audio)
+
+    def test_export_single_session_copies_existing_wav_audio_without_silk_conversion(self):
+        source_dir = self.base / "msg" / "attach" / self.session_hash / "2024-08" / "Audio"
+        source_file = source_dir / "2_1722858001.wav"
+        wav_bytes = self._make_wav_bytes()
+        source_file.write_bytes(wav_bytes)
+
+        old_silk_path = source_dir / "2_1722858001.silk"
+        if old_silk_path.exists():
+            old_silk_path.unlink()
+
+        export_single_session(
+            decrypted_dir=str(self.decrypted_dir),
+            contact_username=self.contact_username,
+            contact_display_name="好友",
+            output_dir=str(self.output_dir),
+            owner_id="wxid_owner",
+            printer=lambda *_args, **_kwargs: None,
+        )
+
+        payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload[1]["file_path"], f"audio/{self.session_hash}/2_1722858001.wav")
+        self.assertEqual((self.output_dir / payload[1]["file_path"]).read_bytes(), wav_bytes)
+
+    def test_export_single_session_decodes_v2_dat_image_with_image_key_map(self):
+        image_bytes = self._make_image_bytes("JPEG")
+        aes_key = bytes.fromhex("11223344556677889900aabbccddeeff")
+        ciphertext_hex, full_dat = self._make_v2_dat_bytes(image_bytes, aes_key, xor_key=0x42)
+        _, thumb_dat = self._make_v2_dat_bytes(image_bytes, aes_key, xor_key=0x42)
+
+        img_dir = self.base / "msg" / "attach" / self.session_hash / "2024-08" / "Img"
+        (img_dir / "1_1722858000.dat").write_bytes(full_dat)
+        (img_dir / "1_1722858000_t.dat").write_bytes(thumb_dat)
+
+        with patch("media_conversion.load_wechat_image_keys", return_value={ciphertext_hex: aes_key}):
+            export_single_session(
+                decrypted_dir=str(self.decrypted_dir),
+                contact_username=self.contact_username,
+                contact_display_name="好友",
+                output_dir=str(self.output_dir),
+                owner_id="wxid_owner",
+                printer=lambda *_args, **_kwargs: None,
+            )
+
+        payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload[0]["file_path"], f"images/{self.session_hash}/1_1722858000.jpg")
+        self.assertTrue((self.output_dir / payload[0]["file_path"]).exists())
 
 
 class MediaPathInferenceTests(unittest.TestCase):

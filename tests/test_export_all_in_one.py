@@ -3,6 +3,7 @@ from unittest.mock import patch
 import subprocess
 import sys
 import os
+import tempfile
 
 import export_all_in_one
 
@@ -58,6 +59,11 @@ class CommandTests(unittest.TestCase):
         )
 
     @patch("export_all_in_one.subprocess.run")
+    def test_ensure_sudo_access_requests_visible_authorization(self, mock_run):
+        export_all_in_one.ensure_sudo_access()
+        mock_run.assert_called_once_with(["sudo", "-v"], check=True, cwd=os.path.dirname(os.path.abspath(export_all_in_one.__file__)))
+
+    @patch("export_all_in_one.subprocess.run")
     def test_run_decrypt_uses_current_python_and_decrypt_script(self, mock_run):
         export_all_in_one.run_decrypt()
         module_dir = os.path.dirname(os.path.abspath(export_all_in_one.__file__))
@@ -70,20 +76,35 @@ class CommandTests(unittest.TestCase):
 
 
 class MainTests(unittest.TestCase):
+    def test_has_usable_keys_file_returns_false_when_file_is_missing(self):
+        self.assertFalse(export_all_in_one.has_usable_keys_file("/tmp/missing-all-keys.json"))
+
+    def test_has_usable_keys_file_returns_false_for_empty_json_object(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            keys_path = os.path.join(temp_dir, "all_keys.json")
+            with open(keys_path, "w", encoding="utf-8") as handle:
+                handle.write("{}")
+
+            self.assertFalse(export_all_in_one.has_usable_keys_file(keys_path))
+
     @patch("export_all_in_one.print")
     @patch("export_all_in_one.export_all_sessions")
     @patch("export_all_in_one.detect_owner_id", return_value="wxid_owner")
     @patch("export_all_in_one.run_decrypt")
     @patch("export_all_in_one.run_key_scan")
+    @patch("export_all_in_one.has_usable_keys_file", return_value=True)
+    @patch("export_all_in_one.ensure_sudo_access")
     @patch("export_all_in_one.ensure_key_scanner")
     @patch(
         "export_all_in_one.load_config",
-        return_value={"decrypted_dir": "/config/decrypted"},
+        return_value={"decrypted_dir": "/config/decrypted", "keys_file": "/config/all_keys.json"},
     )
     def test_main_runs_full_pipeline_by_default(
         self,
         mock_load_config,
         mock_ensure_key_scanner,
+        mock_ensure_sudo_access,
+        mock_has_usable_keys_file,
         mock_run_key_scan,
         mock_run_decrypt,
         mock_detect_owner_id,
@@ -97,7 +118,9 @@ class MainTests(unittest.TestCase):
         self.assertEqual(result, 0)
         mock_load_config.assert_called_once_with()
         mock_ensure_key_scanner.assert_called_once_with()
+        mock_ensure_sudo_access.assert_called_once_with()
         mock_run_key_scan.assert_called_once_with()
+        mock_has_usable_keys_file.assert_called_once_with("/config/all_keys.json")
         mock_run_decrypt.assert_called_once_with()
         mock_detect_owner_id.assert_called_once_with()
         mock_export_all_sessions.assert_called_once_with(
@@ -105,8 +128,10 @@ class MainTests(unittest.TestCase):
             output_dir="/tmp/out",
             owner_id="wxid_owner",
         )
-        mock_print.assert_called_once_with(
-            "Export finished: success_count=3 failed_count=1 output=/tmp/out"
+        self.assertEqual(mock_print.call_args_list[0].args[0], "Requesting administrator permission for key scan...")
+        self.assertEqual(
+            mock_print.call_args_list[1].args[0],
+            "Export finished: success_count=3 failed_count=1 output=/tmp/out",
         )
 
     @patch("export_all_in_one.print")
@@ -159,17 +184,52 @@ class MainTests(unittest.TestCase):
 
     @patch("export_all_in_one.print")
     @patch("export_all_in_one.export_all_sessions")
+    @patch("export_all_in_one.run_decrypt")
+    @patch("export_all_in_one.run_key_scan")
+    @patch("export_all_in_one.ensure_sudo_access")
+    @patch("export_all_in_one.ensure_key_scanner")
+    @patch(
+        "export_all_in_one.load_config",
+        return_value={"decrypted_dir": "/config/decrypted", "keys_file": "/config/all_keys.json"},
+    )
+    @patch("export_all_in_one.has_usable_keys_file", return_value=False, create=True)
+    def test_main_exits_when_scan_finishes_without_usable_keys(
+        self,
+        mock_has_usable_keys_file,
+        mock_load_config,
+        mock_ensure_key_scanner,
+        mock_ensure_sudo_access,
+        mock_run_key_scan,
+        mock_run_decrypt,
+        mock_export_all_sessions,
+        mock_print,
+    ):
+        result = export_all_in_one.main(["--output", "/tmp/out"])
+
+        self.assertEqual(result, 1)
+        mock_ensure_key_scanner.assert_called_once_with()
+        mock_ensure_sudo_access.assert_called_once_with()
+        mock_run_key_scan.assert_called_once_with()
+        mock_has_usable_keys_file.assert_called_once_with("/config/all_keys.json")
+        mock_run_decrypt.assert_not_called()
+        mock_export_all_sessions.assert_not_called()
+        self.assertEqual(mock_print.call_args_list[1].args[0], "Error: 未找到可用的微信数据库密钥，请先打开并登录微信。")
+
+    @patch("export_all_in_one.print")
+    @patch("export_all_in_one.export_all_sessions")
     @patch("export_all_in_one.detect_owner_id")
     @patch(
         "export_all_in_one.run_key_scan",
         side_effect=subprocess.CalledProcessError(1, ["sudo", "scanner"]),
     )
+    @patch("export_all_in_one.ensure_sudo_access")
     @patch("export_all_in_one.ensure_key_scanner")
     @patch("export_all_in_one.load_config", return_value={"decrypted_dir": "/config/decrypted"})
     def test_main_returns_1_on_subprocess_failure(
         self,
         mock_load_config,
         mock_ensure_key_scanner,
+        mock_ensure_sudo_access,
         mock_run_key_scan,
         mock_detect_owner_id,
         mock_export_all_sessions,
@@ -180,10 +240,11 @@ class MainTests(unittest.TestCase):
         self.assertEqual(result, 1)
         mock_load_config.assert_called_once_with()
         mock_ensure_key_scanner.assert_called_once_with()
+        mock_ensure_sudo_access.assert_called_once_with()
         mock_run_key_scan.assert_called_once_with()
         mock_detect_owner_id.assert_not_called()
         mock_export_all_sessions.assert_not_called()
-        mock_print.assert_not_called()
+        mock_print.assert_called_once_with("Requesting administrator permission for key scan...")
 
     @patch("export_all_in_one.os.path.exists", return_value=True)
     @patch("export_all_in_one.print")
@@ -198,6 +259,8 @@ class MainTests(unittest.TestCase):
             stderr="WeChat not running or invalid PID\n",
         ),
     )
+    @patch("export_all_in_one.has_usable_keys_file", return_value=True)
+    @patch("export_all_in_one.ensure_sudo_access")
     @patch("export_all_in_one.ensure_key_scanner")
     @patch(
         "export_all_in_one.load_config",
@@ -210,6 +273,8 @@ class MainTests(unittest.TestCase):
         self,
         mock_load_config,
         mock_ensure_key_scanner,
+        mock_ensure_sudo_access,
+        mock_has_usable_keys_file,
         mock_run_key_scan,
         mock_run_decrypt,
         mock_detect_owner_id,
@@ -224,8 +289,10 @@ class MainTests(unittest.TestCase):
         self.assertEqual(result, 0)
         mock_load_config.assert_called_once_with()
         mock_ensure_key_scanner.assert_called_once_with()
+        mock_ensure_sudo_access.assert_called_once_with()
         mock_run_key_scan.assert_called_once_with()
         mock_exists.assert_any_call("/config/all_keys.json")
+        mock_has_usable_keys_file.assert_called_once_with("/config/all_keys.json")
         mock_run_decrypt.assert_called_once_with()
         mock_detect_owner_id.assert_called_once_with()
         mock_export_all_sessions.assert_called_once_with(
@@ -233,10 +300,11 @@ class MainTests(unittest.TestCase):
             output_dir="/tmp/out",
             owner_id="wxid_owner",
         )
-        self.assertEqual(mock_print.call_count, 2)
-        self.assertIn("existing key file", mock_print.call_args_list[0].args[0])
+        self.assertEqual(mock_print.call_count, 3)
+        self.assertEqual(mock_print.call_args_list[0].args[0], "Requesting administrator permission for key scan...")
+        self.assertIn("existing key file", mock_print.call_args_list[1].args[0])
         self.assertEqual(
-            mock_print.call_args_list[1].args[0],
+            mock_print.call_args_list[2].args[0],
             "Export finished: success_count=1 failed_count=0 output=/tmp/out",
         )
 

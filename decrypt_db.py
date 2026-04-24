@@ -5,9 +5,13 @@ WeChat 4.0 数据库解密器
 参数: SQLCipher 4, AES-256-CBC, HMAC-SHA512, reserve=80, page_size=4096
 密钥来源: all_keys.json (由find_all_keys.py从内存提取)
 """
+import ctypes
 import hashlib, struct, os, sys, json
 import hmac as hmac_mod
-from Crypto.Cipher import AES
+try:
+    from Crypto.Cipher import AES
+except ImportError:  # pragma: no cover - optional dependency in the user's runtime
+    AES = None
 
 import functools
 print = functools.partial(print, flush=True)
@@ -27,6 +31,73 @@ DB_DIR = _cfg["db_dir"]
 OUT_DIR = _cfg["decrypted_dir"]
 KEYS_FILE = _cfg["keys_file"]
 
+_COMMON_CRYPTO = None
+
+
+def _load_common_crypto():
+    global _COMMON_CRYPTO
+    if _COMMON_CRYPTO is not None:
+        return _COMMON_CRYPTO
+
+    candidates = (
+        "/usr/lib/system/libcommonCrypto.dylib",
+        "/usr/lib/libSystem.B.dylib",
+        "/usr/lib/libSystem.dylib",
+    )
+    for candidate in candidates:
+        try:
+            lib = ctypes.CDLL(candidate)
+        except OSError:
+            continue
+        if not hasattr(lib, "CCCrypt"):
+            continue
+
+        cccrypt = lib.CCCrypt
+        cccrypt.argtypes = [
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        cccrypt.restype = ctypes.c_int
+        _COMMON_CRYPTO = lib
+        return _COMMON_CRYPTO
+
+    raise RuntimeError("CommonCrypto is unavailable on this system")
+
+
+def decrypt_aes_cbc(enc_key, iv, encrypted):
+    if AES is not None:
+        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
+        return cipher.decrypt(encrypted)
+
+    lib = _load_common_crypto()
+    output = ctypes.create_string_buffer(len(encrypted))
+    out_len = ctypes.c_size_t(0)
+    status = lib.CCCrypt(
+        1,  # kCCDecrypt
+        0,  # kCCAlgorithmAES128 / AES
+        0,  # CBC + no padding
+        ctypes.c_char_p(enc_key),
+        len(enc_key),
+        ctypes.c_char_p(iv),
+        ctypes.c_char_p(encrypted),
+        len(encrypted),
+        output,
+        len(encrypted),
+        ctypes.byref(out_len),
+    )
+    if status != 0 or out_len.value != len(encrypted):
+        raise RuntimeError(f"CommonCrypto AES-CBC decrypt failed: status={status}, out_len={out_len.value}")
+    return output.raw[: out_len.value]
+
 
 def derive_mac_key(enc_key, salt):
     """从enc_key派生HMAC密钥"""
@@ -40,15 +111,13 @@ def decrypt_page(enc_key, page_data, pgno):
 
     if pgno == 1:
         encrypted = page_data[SALT_SZ : PAGE_SZ - RESERVE_SZ]
-        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
+        decrypted = decrypt_aes_cbc(enc_key, iv, encrypted)
         page = bytearray(SQLITE_HDR + decrypted + b'\x00' * RESERVE_SZ)
         # 保留 reserve=80, B-tree 基于 usable_size=4016 构建
         return bytes(page)
     else:
         encrypted = page_data[:PAGE_SZ - RESERVE_SZ]
-        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
+        decrypted = decrypt_aes_cbc(enc_key, iv, encrypted)
         return decrypted + b'\x00' * RESERVE_SZ
 
 

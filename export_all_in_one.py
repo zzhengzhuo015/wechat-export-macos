@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -51,6 +52,10 @@ def run_key_scan(scanner_path="./find_all_keys_macos"):
     )
 
 
+def ensure_sudo_access():
+    subprocess.run(["sudo", "-v"], check=True, cwd=_module_dir())
+
+
 def run_decrypt():
     module_dir = _module_dir()
     decrypt_script = os.path.join(module_dir, "decrypt_db.py")
@@ -73,6 +78,23 @@ def can_reuse_existing_keys(scan_error, keys_file):
         return False
     stderr = getattr(scan_error, "stderr", "") or ""
     return "WeChat not running or invalid PID" in stderr
+
+
+def has_usable_keys_file(keys_file):
+    if not keys_file:
+        return False
+
+    resolved_path = _module_path(keys_file)
+    if not os.path.exists(resolved_path):
+        return False
+
+    try:
+        with open(resolved_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return False
+
+    return isinstance(payload, dict) and bool(payload)
 
 
 def main(argv=None):
@@ -109,6 +131,8 @@ def main(argv=None):
     try:
         if not args.skip_scan:
             ensure_key_scanner()
+            print("Requesting administrator permission for key scan...")
+            ensure_sudo_access()
             try:
                 run_key_scan()
             except subprocess.CalledProcessError as exc:
@@ -119,6 +143,9 @@ def main(argv=None):
                     )
                 else:
                     raise
+        if not args.skip_decrypt and not has_usable_keys_file(keys_file):
+            print("Error: 未找到可用的微信数据库密钥，请先打开并登录微信。")
+            return 1
         if not args.skip_decrypt:
             run_decrypt()
     except subprocess.CalledProcessError:
