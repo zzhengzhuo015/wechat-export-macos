@@ -11,7 +11,7 @@ from pathlib import Path
 from time import time
 
 from config import load_config
-from media_conversion import try_convert_image_bytes, try_convert_silk_bytes_to_wav
+from media_conversion import try_convert_image_file, try_convert_silk_bytes_to_wav
 
 
 FORBIDDEN_FILENAME_CHARS = r'[<>:"/\\|?*\x00-\x1f]'
@@ -387,7 +387,7 @@ def _build_export_basename(local_id, create_time, source_path):
 
 
 def _write_normalized_image(output_dir, media_kind, session_hash, local_id, create_time, source_path):
-    converted = try_convert_image_bytes(source_path.name, source_path.read_bytes())
+    converted = try_convert_image_file(source_path)
     if converted is None:
         return ""
 
@@ -396,6 +396,15 @@ def _write_normalized_image(output_dir, media_kind, session_hash, local_id, crea
     destination = Path(output_dir) / relative_path
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(payload)
+    return relative_path.as_posix()
+
+
+def _write_raw_image_file(output_dir, session_hash, local_id, create_time, source_path):
+    suffix = source_path.suffix or ".bin"
+    relative_path = Path("images") / session_hash / f"{local_id}_{create_time}{suffix}"
+    destination = Path(output_dir) / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(source_path.read_bytes())
     return relative_path.as_posix()
 
 
@@ -408,6 +417,22 @@ def _write_wav_bytes(output_dir, session_hash, local_id, create_time, silk_bytes
     destination = Path(output_dir) / relative_path
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(wav_bytes)
+    return relative_path.as_posix()
+
+
+def _write_raw_audio_file(output_dir, session_hash, local_id, create_time, audio_bytes, suffix=".silk"):
+    relative_path = Path("audio") / session_hash / f"{local_id}_{create_time}{suffix}"
+    destination = Path(output_dir) / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(audio_bytes)
+    return relative_path.as_posix()
+
+
+def _write_existing_wav_file(output_dir, session_hash, local_id, create_time, source_path):
+    relative_path = Path("audio") / session_hash / f"{local_id}_{create_time}.wav"
+    destination = Path(output_dir) / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(source_path.read_bytes())
     return relative_path.as_posix()
 
 
@@ -449,11 +474,21 @@ def export_media_file(
             return ""
 
         session_hash = session_hash_for_username(session_username)
-        return _write_wav_bytes(output_dir, session_hash, local_id, create_time, voice_blob)
+        file_path = _write_wav_bytes(output_dir, session_hash, local_id, create_time, voice_blob)
+        if file_path:
+            return file_path
+        return _write_raw_audio_file(
+            output_dir=output_dir,
+            session_hash=session_hash,
+            local_id=local_id,
+            create_time=create_time,
+            audio_bytes=voice_blob,
+            suffix=".silk",
+        )
 
     session_hash = session_hash_for_username(session_username)
     if media_kind == "images":
-        return _write_normalized_image(
+        file_path = _write_normalized_image(
             output_dir=output_dir,
             media_kind=media_kind,
             session_hash=session_hash,
@@ -461,8 +496,26 @@ def export_media_file(
             create_time=create_time,
             source_path=source_path,
         )
+        if file_path:
+            return file_path
+        return _write_raw_image_file(
+            output_dir=output_dir,
+            session_hash=session_hash,
+            local_id=local_id,
+            create_time=create_time,
+            source_path=source_path,
+        )
 
     if media_kind == "audio":
+        if source_path.suffix.lower() == ".wav":
+            return _write_existing_wav_file(
+                output_dir=output_dir,
+                session_hash=session_hash,
+                local_id=local_id,
+                create_time=create_time,
+                source_path=source_path,
+            )
+
         file_path = _write_wav_bytes(output_dir, session_hash, local_id, create_time, source_path.read_bytes())
         if file_path:
             return file_path
@@ -470,9 +523,19 @@ def export_media_file(
         voice_blob = _lookup_voice_blob(
             media_context, session_username, local_id, create_time, server_id
         )
-        if not voice_blob:
-            return ""
-        return _write_wav_bytes(output_dir, session_hash, local_id, create_time, voice_blob)
+        if voice_blob:
+            file_path = _write_wav_bytes(output_dir, session_hash, local_id, create_time, voice_blob)
+            if file_path:
+                return file_path
+
+        return _write_raw_audio_file(
+            output_dir=output_dir,
+            session_hash=session_hash,
+            local_id=local_id,
+            create_time=create_time,
+            audio_bytes=source_path.read_bytes(),
+            suffix=source_path.suffix.lower() or ".silk",
+        )
 
     basename = _build_export_basename(local_id, create_time, source_path)
     relative_path = Path(media_kind) / session_hash / basename
