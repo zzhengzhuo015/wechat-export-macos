@@ -88,6 +88,7 @@ class MainTests(unittest.TestCase):
             self.assertFalse(export_all_in_one.has_usable_keys_file(keys_path))
 
     @patch("export_all_in_one.print")
+    @patch("export_all_in_one.export_contacts")
     @patch("export_all_in_one.export_all_sessions")
     @patch("export_all_in_one.detect_owner_id", return_value="wxid_owner")
     @patch("export_all_in_one.run_decrypt")
@@ -109,6 +110,7 @@ class MainTests(unittest.TestCase):
         mock_run_decrypt,
         mock_detect_owner_id,
         mock_export_all_sessions,
+        mock_export_contacts,
         mock_print,
     ):
         mock_export_all_sessions.return_value = {"success_count": 3, "failed_count": 1}
@@ -125,16 +127,22 @@ class MainTests(unittest.TestCase):
         mock_detect_owner_id.assert_called_once_with()
         mock_export_all_sessions.assert_called_once_with(
             decrypted_dir="/config/decrypted",
-            output_dir="/tmp/out",
+            output_dir="/tmp/out/chats",
+            owner_id="wxid_owner",
+        )
+        mock_export_contacts.assert_called_once_with(
+            contact_db_path="/config/decrypted/contact/contact.db",
+            output_dir="/tmp/out/contacts",
             owner_id="wxid_owner",
         )
         self.assertEqual(mock_print.call_args_list[0].args[0], "Requesting administrator permission for key scan...")
         self.assertEqual(
             mock_print.call_args_list[1].args[0],
-            "Export finished: success_count=3 failed_count=1 output=/tmp/out",
+            "Export finished: success_count=3 failed_count=1 output=/tmp/out"
         )
 
     @patch("export_all_in_one.print")
+    @patch("export_all_in_one.export_contacts")
     @patch("export_all_in_one.export_all_sessions")
     @patch("export_all_in_one.detect_owner_id", return_value="")
     @patch("export_all_in_one.run_decrypt")
@@ -152,6 +160,7 @@ class MainTests(unittest.TestCase):
         mock_run_decrypt,
         mock_detect_owner_id,
         mock_export_all_sessions,
+        mock_export_contacts,
         mock_print,
     ):
         mock_export_all_sessions.return_value = {"success_count": 2, "failed_count": 0}
@@ -175,10 +184,71 @@ class MainTests(unittest.TestCase):
         mock_detect_owner_id.assert_called_once_with()
         mock_export_all_sessions.assert_called_once_with(
             decrypted_dir="/tmp/decrypted",
-            output_dir="/tmp/out",
+            output_dir="/tmp/out/chats",
+            owner_id="",
+        )
+        mock_export_contacts.assert_called_once_with(
+            contact_db_path="/tmp/decrypted/contact/contact.db",
+            output_dir="/tmp/out/contacts",
             owner_id="",
         )
         mock_print.assert_called_once_with(
+            "Export finished: success_count=2 failed_count=0 output=/tmp/out"
+        )
+
+    @patch("export_all_in_one.print")
+    @patch("export_all_in_one.export_contacts")
+    @patch("export_all_in_one.export_all_sessions")
+    @patch("export_all_in_one.detect_owner_id", return_value="")
+    @patch("export_all_in_one.run_decrypt")
+    @patch("export_all_in_one.run_key_scan")
+    @patch("export_all_in_one.has_usable_keys_file", return_value=True)
+    @patch("export_all_in_one.ensure_sudo_access")
+    @patch("export_all_in_one.ensure_key_scanner")
+    @patch(
+        "export_all_in_one.load_config",
+        return_value={"decrypted_dir": "/config/decrypted", "keys_file": "/config/all_keys.json"},
+    )
+    def test_main_skip_export_contacts_only_exports_sessions(
+        self,
+        mock_load_config,
+        mock_ensure_key_scanner,
+        mock_ensure_sudo_access,
+        mock_has_usable_keys_file,
+        mock_run_key_scan,
+        mock_run_decrypt,
+        mock_detect_owner_id,
+        mock_export_all_sessions,
+        mock_export_contacts,
+        mock_print,
+    ):
+        mock_export_all_sessions.return_value = {"success_count": 2, "failed_count": 0}
+
+        result = export_all_in_one.main(
+            [
+                "--output",
+                "/tmp/out",
+                "--skip-export-contacts",
+            ]
+        )
+
+        self.assertEqual(result, 0)
+        mock_load_config.assert_called_once_with()
+        mock_ensure_key_scanner.assert_called_once_with()
+        mock_ensure_sudo_access.assert_called_once_with()
+        mock_run_key_scan.assert_called_once_with()
+        mock_has_usable_keys_file.assert_called_once_with("/config/all_keys.json")
+        mock_run_decrypt.assert_called_once_with()
+        mock_detect_owner_id.assert_called_once_with()
+        mock_export_all_sessions.assert_called_once_with(
+            decrypted_dir="/config/decrypted",
+            output_dir="/tmp/out/chats",
+            owner_id="",
+        )
+        mock_export_contacts.assert_not_called()
+        self.assertEqual(mock_print.call_args_list[0].args[0], "Requesting administrator permission for key scan...")
+        self.assertEqual(
+            mock_print.call_args_list[1].args[0],
             "Export finished: success_count=2 failed_count=0 output=/tmp/out"
         )
 
@@ -244,10 +314,100 @@ class MainTests(unittest.TestCase):
         mock_run_key_scan.assert_called_once_with()
         mock_detect_owner_id.assert_not_called()
         mock_export_all_sessions.assert_not_called()
-        mock_print.assert_called_once_with("Requesting administrator permission for key scan...")
+        self.assertEqual(mock_print.call_args_list[0].args[0], "Requesting administrator permission for key scan...")
+        self.assertEqual(mock_print.call_args_list[1].kwargs.get("file"), sys.stderr)
+        self.assertIn("One-click export failed", mock_print.call_args_list[1].args[0])
+
+    @patch("export_all_in_one.os.path.exists", return_value=False)
+    @patch("export_all_in_one.print")
+    @patch("export_all_in_one.export_all_sessions")
+    @patch("export_all_in_one.detect_owner_id")
+    @patch(
+        "export_all_in_one.run_key_scan",
+        side_effect=subprocess.CalledProcessError(
+            1,
+            ["sudo", "scanner"],
+            stderr="WeChat not running or invalid PID\n",
+        ),
+    )
+    @patch("export_all_in_one.ensure_sudo_access")
+    @patch("export_all_in_one.ensure_key_scanner")
+    @patch(
+        "export_all_in_one.load_config",
+        return_value={
+            "decrypted_dir": "/config/decrypted",
+            "keys_file": "/config/all_keys.json",
+        },
+    )
+    def test_main_prints_explicit_error_when_wechat_is_not_running_and_no_keys_can_be_reused(
+        self,
+        mock_load_config,
+        mock_ensure_key_scanner,
+        mock_ensure_sudo_access,
+        mock_run_key_scan,
+        mock_detect_owner_id,
+        mock_export_all_sessions,
+        mock_print,
+        mock_exists,
+    ):
+        result = export_all_in_one.main(["--output", "/tmp/out"])
+
+        self.assertEqual(result, 1)
+        mock_load_config.assert_called_once_with()
+        mock_ensure_key_scanner.assert_called_once_with()
+        mock_ensure_sudo_access.assert_called_once_with()
+        mock_run_key_scan.assert_called_once_with()
+        mock_exists.assert_any_call("/config/all_keys.json")
+        mock_detect_owner_id.assert_not_called()
+        mock_export_all_sessions.assert_not_called()
+        self.assertEqual(mock_print.call_args_list[0].args[0], "Requesting administrator permission for key scan...")
+        self.assertEqual(mock_print.call_args_list[1].kwargs.get("file"), sys.stderr)
+        self.assertIn("微信未运行", mock_print.call_args_list[1].args[0])
+
+    @patch("export_all_in_one.print")
+    @patch(
+        "export_all_in_one.export_all_sessions",
+        side_effect=FileNotFoundError("未找到联系人数据库: /tmp/decrypted/contact/contact.db"),
+    )
+    @patch("export_all_in_one.detect_owner_id", return_value="")
+    @patch("export_all_in_one.run_decrypt")
+    @patch("export_all_in_one.run_key_scan")
+    @patch("export_all_in_one.has_usable_keys_file", return_value=True)
+    @patch("export_all_in_one.ensure_sudo_access")
+    @patch("export_all_in_one.ensure_key_scanner")
+    @patch(
+        "export_all_in_one.load_config",
+        return_value={"decrypted_dir": "/tmp/decrypted", "keys_file": "/config/all_keys.json"},
+    )
+    def test_main_prints_readable_error_when_export_input_is_missing(
+        self,
+        mock_load_config,
+        mock_ensure_key_scanner,
+        mock_ensure_sudo_access,
+        mock_has_usable_keys_file,
+        mock_run_key_scan,
+        mock_run_decrypt,
+        mock_detect_owner_id,
+        mock_export_all_sessions,
+        mock_print,
+    ):
+        result = export_all_in_one.main(["--output", "/tmp/out"])
+
+        self.assertEqual(result, 1)
+        mock_load_config.assert_called_once_with()
+        mock_ensure_key_scanner.assert_called_once_with()
+        mock_ensure_sudo_access.assert_called_once_with()
+        mock_run_key_scan.assert_called_once_with()
+        mock_has_usable_keys_file.assert_called_once_with("/config/all_keys.json")
+        mock_run_decrypt.assert_called_once_with()
+        mock_detect_owner_id.assert_called_once_with()
+        self.assertEqual(mock_print.call_args_list[0].args[0], "Requesting administrator permission for key scan...")
+        self.assertEqual(mock_print.call_args_list[1].kwargs.get("file"), sys.stderr)
+        self.assertIn("未找到联系人数据库", mock_print.call_args_list[1].args[0])
 
     @patch("export_all_in_one.os.path.exists", return_value=True)
     @patch("export_all_in_one.print")
+    @patch("export_all_in_one.export_contacts")
     @patch("export_all_in_one.export_all_sessions")
     @patch("export_all_in_one.detect_owner_id", return_value="wxid_owner")
     @patch("export_all_in_one.run_decrypt")
@@ -279,6 +439,7 @@ class MainTests(unittest.TestCase):
         mock_run_decrypt,
         mock_detect_owner_id,
         mock_export_all_sessions,
+        mock_export_contacts,
         mock_print,
         mock_exists,
     ):
@@ -297,7 +458,12 @@ class MainTests(unittest.TestCase):
         mock_detect_owner_id.assert_called_once_with()
         mock_export_all_sessions.assert_called_once_with(
             decrypted_dir="/config/decrypted",
-            output_dir="/tmp/out",
+            output_dir="/tmp/out/chats",
+            owner_id="wxid_owner",
+        )
+        mock_export_contacts.assert_called_once_with(
+            contact_db_path="/config/decrypted/contact/contact.db",
+            output_dir="/tmp/out/contacts",
             owner_id="wxid_owner",
         )
         self.assertEqual(mock_print.call_count, 3)

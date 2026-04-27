@@ -89,10 +89,18 @@ python3 export_chat.py --name "张三" --my-wxid wxid_xxxxx --output ~/Downloads
 python3 export_all_in_one.py --output ~/Downloads/wechat-export
 ```
 
+如需跳过通讯录导出：
+
+```bash
+python3 export_all_in_one.py --output ~/Downloads/wechat-export --skip-export-contacts
+```
+
 - 输出目录中每个会话对应一个 JSON 文件
+- 聊天记录会写入 `chats/` 子目录
+- 通讯录会写入 `contacts/` 子目录下的 `contacts.json` 和 `contacts.csv`
 - JSON 结构与 Chatlab 风格示例一致（`chatlab` / `meta` / `members` / `messages`）
 - 文件名优先使用联系人或群名称；同名冲突时自动追加 `-2`、`-3` 等后缀
-- 图片消息和音频消息会额外导出到输出目录下的 `images/`、`audio/` 子目录
+- 图片消息和音频消息会额外导出到 `chats/images/`、`chats/audio/` 子目录
 - 对应消息的 JSON 会写入相对路径字段 `file_path`
 - 媒体会按内容规范化导出：普通照片 -> `jpg`，静态透明图/贴纸类图片 -> `png`，动画图片 -> `gif`，语音 -> `wav`
 
@@ -112,6 +120,17 @@ python3 export_all_in_one.py --output ~/Downloads/wechat-export
 - 动画图片 -> `images/<session_hash>/xxx.gif`
 - 语音 -> `audio/<session_hash>/xxx.wav`
 
+### 导出通讯录联系人
+
+```bash
+python3 export_contacts.py --output ~/Downloads/wechat-contacts
+```
+
+- 输出 `contacts.json` 和 `contacts.csv`
+- 默认只导出真实联系人，不包含群聊、本人和常见系统账号
+- JSON 顶层包含 `meta` 和 `contacts`
+- 每个联系人同时保留标准化字段和 `contact` 表原始字段
+
 ## 聊天记录迁移提示
 
 Mac 微信默认只保留在 Mac 上收发的消息。如果需要手机上的历史记录：
@@ -128,6 +147,7 @@ Mac 微信默认只保留在 Mac 上收发的消息。如果需要手机上的�
 | `find_all_keys_macos.c` | C 语言密钥扫描器，通过 Mach VM API 读取微信进程内存 |
 | `decrypt_db.py` | 数据库解密器，逐页解密 SQLCipher 4 加密的数据库 |
 | `export_chat.py` | 聊天记录导出工具，支持按联系人导出为 TXT/CSV/JSON |
+| `export_contacts.py` | 通讯录导出工具，支持导出联系人为 CSV/JSON |
 | `config.py` | 配置加载器，自动检测微信数据目录 |
 | `key_utils.py` | 密钥工具函数 |
 

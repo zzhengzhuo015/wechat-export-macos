@@ -1,11 +1,13 @@
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 
-from chat_export import export_all_sessions
+from chat_export import export_all_sessions, resolve_contact_db_path
 from config import load_config
+from export_contacts import export_contacts
 
 
 def _module_dir():
@@ -97,6 +99,23 @@ def has_usable_keys_file(keys_file):
     return isinstance(payload, dict) and bool(payload)
 
 
+def describe_subprocess_error(exc):
+    stderr = (getattr(exc, "stderr", "") or "").strip()
+    if "WeChat not running or invalid PID" in stderr:
+        return "微信未运行，无法扫描密钥。请先启动并登录微信。"
+    if stderr:
+        return stderr
+    return str(exc)
+
+
+def chat_output_dir(base_output_dir):
+    return os.path.join(base_output_dir, "chats")
+
+
+def contact_output_dir(base_output_dir):
+    return os.path.join(base_output_dir, "contacts")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="One-click WeChat export")
     parser.add_argument("--output", required=True)
@@ -104,6 +123,7 @@ def main(argv=None):
     parser.add_argument("--keep-decrypted", action="store_true")
     parser.add_argument("--skip-scan", action="store_true")
     parser.add_argument("--skip-decrypt", action="store_true")
+    parser.add_argument("--skip-export-contacts", action="store_true")
     args = parser.parse_args(argv)
 
     if args.decrypted_dir and args.skip_scan and args.skip_decrypt:
@@ -148,15 +168,27 @@ def main(argv=None):
             return 1
         if not args.skip_decrypt:
             run_decrypt()
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
+        print(f"One-click export failed: {describe_subprocess_error(exc)}", file=sys.stderr)
         return 1
 
-    owner_id = detect_owner_id()
-    summary = export_all_sessions(
-        decrypted_dir=decrypted_dir,
-        output_dir=args.output,
-        owner_id=owner_id,
-    )
+    try:
+        owner_id = detect_owner_id()
+        summary = export_all_sessions(
+            decrypted_dir=decrypted_dir,
+            output_dir=chat_output_dir(args.output),
+            owner_id=owner_id,
+        )
+        if not args.skip_export_contacts:
+            contact_db_path = resolve_contact_db_path(decrypted_dir)
+            export_contacts(
+                contact_db_path=contact_db_path,
+                output_dir=contact_output_dir(args.output),
+                owner_id=owner_id,
+            )
+    except (FileNotFoundError, OSError, sqlite3.DatabaseError, ValueError, TypeError) as exc:
+        print(f"One-click export failed: {exc}", file=sys.stderr)
+        return 1
     print(
         "Export finished: success_count="
         f"{summary.get('success_count', 0)} "
