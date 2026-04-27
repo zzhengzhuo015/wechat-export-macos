@@ -96,10 +96,11 @@ python3 export_all_in_one.py --output ~/Downloads/wechat-export --skip-export-co
 ```
 
 - 输出目录中每个会话对应一个 JSON 文件
-- 默认还会在输出目录根部额外生成 `contacts.json` 和 `contacts.csv`
+- 聊天记录会写入 `chats/` 子目录
+- 通讯录会写入 `contacts/` 子目录下的 `contacts.json` 和 `contacts.csv`
 - JSON 结构与 Chatlab 风格示例一致（`chatlab` / `meta` / `members` / `messages`）
 - 文件名优先使用联系人或群名称；同名冲突时自动追加 `-2`、`-3` 等后缀
-- 图片消息和音频消息会额外导出到输出目录下的 `images/`、`audio/` 子目录
+- 图片消息和音频消息会额外导出到 `chats/images/`、`chats/audio/` 子目录
 - 对应消息的 JSON 会写入相对路径字段 `file_path`
 - 媒体会按内容规范化导出：普通照片 -> `jpg`，静态透明图/贴纸类图片 -> `png`，动画图片 -> `gif`，语音 -> `wav`
 
