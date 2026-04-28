@@ -2,6 +2,7 @@ import re
 import glob
 import hashlib
 import json
+import html
 import os
 import shutil
 import sqlite3
@@ -263,6 +264,39 @@ def _extract_hex_tokens(raw_value):
     else:
         text = str(raw_value)
     return set(re.findall(r"[0-9a-f]{32}", text.lower()))
+
+
+def _extract_mentions_from_source(source):
+    if source is None:
+        return []
+    if isinstance(source, bytes):
+        text = source.decode("utf-8", errors="replace")
+    else:
+        text = str(source)
+    unescaped = html.unescape(text)
+
+    ordered_ids = []
+    seen = set()
+    for atuserlist in re.findall(r"<atuserlist>(.*?)</atuserlist>", unescaped, flags=re.IGNORECASE | re.DOTALL):
+        for wxid in atuserlist.split(","):
+            wxid = wxid.strip()
+            if not wxid or wxid in seen:
+                continue
+            ordered_ids.append(wxid)
+            seen.add(wxid)
+    return [{"wxid": wxid} for wxid in ordered_ids]
+
+
+def _attach_mentions_to_message(message, source):
+    if not isinstance(message, dict):
+        return
+    if message.get("_raw_type") != 1:
+        return
+    if "mentions" in message:
+        return
+    mentions = _extract_mentions_from_source(source)
+    if mentions:
+        message["mentions"] = mentions
 
 
 def _normalized_local_type(local_type):
@@ -657,12 +691,14 @@ def export_single_session(
             for rowid, user_name in conn.execute("SELECT rowid, user_name FROM Name2Id"):
                 name2id[rowid] = user_name
 
+            source_expression = _source_column_expression(conn, table_name)
+            quoted_table_name = _quote_sqlite_identifier(table_name)
             rows = conn.execute(
                 f"""
                 SELECT local_id, server_id, local_type, create_time,
-                       real_sender_id, message_content, source,
+                       real_sender_id, message_content, {source_expression},
                        WCDB_CT_message_content
-                FROM {table_name}
+                FROM {quoted_table_name}
                 ORDER BY create_time ASC
                 """
             ).fetchall()
@@ -685,6 +721,7 @@ def export_single_session(
                         "_local_id": row[0],
                         "_raw_type": row[2],
                         "_server_id": str(row[1] or ""),
+                        "_source": row[6],
                         "time": datetime.fromtimestamp(row[3], tz=CST).strftime("%Y-%m-%d %H:%M:%S")
                         if row[3]
                         else "",
@@ -711,6 +748,7 @@ def export_single_session(
         return 0
 
     for message in all_messages:
+        _attach_mentions_to_message(message, message.get("_source"))
         if message["_raw_type"] != 1:
             message["file_path"] = export_media_file(
                 media_context=media_context,
@@ -771,6 +809,30 @@ def table_exists(conn, table_name):
     return row is not None
 
 
+def _quote_sqlite_identifier(identifier):
+    escaped = str(identifier).replace('"', '""')
+    return f'"{escaped}"'
+
+
+def table_has_column(conn, table_name, column_name):
+    try:
+        quoted_table_name = _quote_sqlite_identifier(table_name)
+        rows = conn.execute(f"PRAGMA table_info({quoted_table_name})").fetchall()
+    except sqlite3.DatabaseError:
+        return False
+    expected_name = str(column_name).lower()
+    for row in rows:
+        if len(row) > 1 and str(row[1]).lower() == expected_name:
+            return True
+    return False
+
+
+def _source_column_expression(conn, table_name):
+    if table_has_column(conn, table_name, "source"):
+        return "source"
+    return "NULL AS source"
+
+
 def load_name2id(conn):
     mapping = {}
     try:
@@ -783,10 +845,12 @@ def load_name2id(conn):
 
 
 def read_session_rows(conn, table_name):
+    source_expression = _source_column_expression(conn, table_name)
+    quoted_table_name = _quote_sqlite_identifier(table_name)
     return conn.execute(
         f"""
-        SELECT local_id, server_id, local_type, create_time, real_sender_id, message_content
-        FROM {table_name}
+        SELECT local_id, server_id, local_type, create_time, real_sender_id, message_content, {source_expression}
+        FROM {quoted_table_name}
         ORDER BY create_time ASC, local_id ASC
         """
     ).fetchall()
@@ -800,7 +864,7 @@ def list_message_tables(conn):
 
 
 def normalize_message(row, name2id, contacts):
-    local_id, server_id, local_type, create_time, real_sender_id, message_content = row
+    local_id, server_id, local_type, create_time, real_sender_id, message_content, source = row
     if real_sender_id in name2id:
         sender_wxid = name2id[real_sender_id]
     elif real_sender_id is None:
@@ -819,6 +883,7 @@ def normalize_message(row, name2id, contacts):
         "_local_id": local_id or 0,
         "_raw_type": local_type or 0,
         "_server_id": str(server_id or ""),
+        "_source": source,
         "sender": sender_wxid,
         "accountName": sender_name,
         "timestamp": create_time or 0,
@@ -912,6 +977,7 @@ def export_all_sessions(decrypted_dir, output_dir, owner_id=""):
             key=lambda item: (item.get("timestamp", 0), item.get("platformMessageId", ""))
         )
         for message in merged_messages:
+            _attach_mentions_to_message(message, message.get("_source"))
             if message.get("_raw_type", 0) != 1:
                 message["file_path"] = export_media_file(
                     media_context=media_context,
