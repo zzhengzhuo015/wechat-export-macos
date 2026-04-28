@@ -11,6 +11,11 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from time import time
 
+try:
+    import zstandard
+except ImportError:  # pragma: no cover - optional runtime dependency
+    zstandard = None
+
 from config import load_config
 from media_conversion import try_convert_image_file, try_convert_silk_bytes_to_wav
 
@@ -285,6 +290,17 @@ def _extract_mentions_from_source(source):
             ordered_ids.append(wxid)
             seen.add(wxid)
     return [{"wxid": wxid} for wxid in ordered_ids]
+
+
+def _decode_source_value(source, compression_type):
+    if source is None:
+        return None
+    if compression_type == 4 and isinstance(source, bytes) and zstandard is not None:
+        try:
+            source = zstandard.ZstdDecompressor().decompress(source)
+        except zstandard.ZstdError:
+            pass
+    return source
 
 
 def _attach_mentions_to_message(message, source):
@@ -692,12 +708,13 @@ def export_single_session(
                 name2id[rowid] = user_name
 
             source_expression = _source_column_expression(conn, table_name)
+            source_compression_expression = _source_compression_expression(conn, table_name)
             quoted_table_name = _quote_sqlite_identifier(table_name)
             rows = conn.execute(
                 f"""
                 SELECT local_id, server_id, local_type, create_time,
                        real_sender_id, message_content, {source_expression},
-                       WCDB_CT_message_content
+                       WCDB_CT_message_content, {source_compression_expression}
                 FROM {quoted_table_name}
                 ORDER BY create_time ASC
                 """
@@ -721,7 +738,7 @@ def export_single_session(
                         "_local_id": row[0],
                         "_raw_type": row[2],
                         "_server_id": str(row[1] or ""),
-                        "_source": row[6],
+                        "_source": _decode_source_value(row[6], row[8]),
                         "time": datetime.fromtimestamp(row[3], tz=CST).strftime("%Y-%m-%d %H:%M:%S")
                         if row[3]
                         else "",
@@ -833,6 +850,12 @@ def _source_column_expression(conn, table_name):
     return "NULL AS source"
 
 
+def _source_compression_expression(conn, table_name):
+    if table_has_column(conn, table_name, "WCDB_CT_source"):
+        return "WCDB_CT_source"
+    return "NULL AS WCDB_CT_source"
+
+
 def load_name2id(conn):
     mapping = {}
     try:
@@ -846,10 +869,12 @@ def load_name2id(conn):
 
 def read_session_rows(conn, table_name):
     source_expression = _source_column_expression(conn, table_name)
+    source_compression_expression = _source_compression_expression(conn, table_name)
     quoted_table_name = _quote_sqlite_identifier(table_name)
     return conn.execute(
         f"""
-        SELECT local_id, server_id, local_type, create_time, real_sender_id, message_content, {source_expression}
+        SELECT local_id, server_id, local_type, create_time, real_sender_id, message_content,
+               {source_expression}, {source_compression_expression}
         FROM {quoted_table_name}
         ORDER BY create_time ASC, local_id ASC
         """
@@ -864,7 +889,7 @@ def list_message_tables(conn):
 
 
 def normalize_message(row, name2id, contacts):
-    local_id, server_id, local_type, create_time, real_sender_id, message_content, source = row
+    local_id, server_id, local_type, create_time, real_sender_id, message_content, source, source_compression = row
     if real_sender_id in name2id:
         sender_wxid = name2id[real_sender_id]
     elif real_sender_id is None:
@@ -883,7 +908,7 @@ def normalize_message(row, name2id, contacts):
         "_local_id": local_id or 0,
         "_raw_type": local_type or 0,
         "_server_id": str(server_id or ""),
-        "_source": source,
+        "_source": _decode_source_value(source, source_compression),
         "sender": sender_wxid,
         "accountName": sender_name,
         "timestamp": create_time or 0,

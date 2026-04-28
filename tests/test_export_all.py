@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import zstandard
+
 from chat_export import export_all_sessions, list_message_databases, session_table_for_username
 
 
@@ -122,6 +124,7 @@ class ExportAllSessionsTests(unittest.TestCase):
         message_db = self.decrypted_dir / "message" / "message_0.db"
         conn = sqlite3.connect(message_db)
         source_column = ", source BLOB" if include_source else ""
+        source_compression_column = ", WCDB_CT_source INTEGER" if include_source else ""
         quoted_table_name = _quote_sqlite_identifier(table_name)
         conn.execute(
             f"""
@@ -133,21 +136,30 @@ class ExportAllSessionsTests(unittest.TestCase):
                 real_sender_id INTEGER,
                 message_content BLOB
                 {source_column}
+                {source_compression_column}
             )
             """
         )
         conn.commit()
         conn.close()
 
-    def _insert_message(self, table_name, row, source=None):
+    def _insert_message(self, table_name, row, source=None, source_compression_type=0):
         message_db = self.decrypted_dir / "message" / "message_0.db"
         conn = sqlite3.connect(message_db)
         quoted_table_name = _quote_sqlite_identifier(table_name)
-        has_source = any(
-            column[1] == "source"
-            for column in conn.execute(f"PRAGMA table_info({quoted_table_name})")
-        )
-        if has_source:
+        columns = [column[1] for column in conn.execute(f"PRAGMA table_info({quoted_table_name})")]
+        has_source = "source" in columns
+        has_source_compression = "WCDB_CT_source" in columns
+        if has_source and has_source_compression:
+            conn.execute(
+                f"""
+                INSERT INTO {quoted_table_name}
+                (local_id, server_id, local_type, create_time, real_sender_id, message_content, source, WCDB_CT_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*row, source, source_compression_type),
+            )
+        elif has_source:
             conn.execute(
                 f"""
                 INSERT INTO {quoted_table_name}
@@ -458,6 +470,33 @@ class ExportAllSessionsTests(unittest.TestCase):
 
         payload = json.loads((self.output_dir / "转义来源.json").read_text(encoding="utf-8"))
         self.assertEqual(payload["messages"][0]["mentions"], [{"wxid": "wxid_friend"}, {"wxid": "wxid_owner"}])
+
+    def test_export_all_sessions_parses_mentions_from_zstd_source(self):
+        compressed_source_username = "wxid_zstd_source"
+        compressed_source_table = session_table_for_username(compressed_source_username)
+        self._insert_contact(compressed_source_username, nick_name="压缩来源")
+        self._create_session_table(compressed_source_table, include_source=True)
+        compressed_source = zstandard.ZstdCompressor().compress(
+            b"<msgsource><atuserlist>wxid_friend,wxid_owner,wxid_friend</atuserlist></msgsource>"
+        )
+        self._insert_message(
+            compressed_source_table,
+            (12, 0, 1, 1722859000, 2, "@friend hello"),
+            source=compressed_source,
+            source_compression_type=4,
+        )
+
+        export_all_sessions(
+            str(self.decrypted_dir),
+            str(self.output_dir),
+            owner_id="wxid_owner",
+        )
+
+        payload = json.loads((self.output_dir / "压缩来源.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["messages"][0]["mentions"],
+            [{"wxid": "wxid_friend"}, {"wxid": "wxid_owner"}],
+        )
 
 
 if __name__ == "__main__":

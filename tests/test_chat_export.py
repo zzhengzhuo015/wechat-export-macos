@@ -7,6 +7,8 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
+import zstandard
+
 from chat_export import (
     _attach_mentions_to_message,
     _extract_mentions_from_source,
@@ -133,19 +135,20 @@ class SingleSessionMediaExportTests(unittest.TestCase):
                 real_sender_id INTEGER,
                 message_content BLOB,
                 source TEXT,
-                WCDB_CT_message_content INTEGER
+                WCDB_CT_message_content INTEGER,
+                WCDB_CT_source INTEGER
             )
             """
         )
         conn.executemany(
             f"""
             INSERT INTO {session_table_for_username(self.contact_username)}
-            (local_id, server_id, local_type, create_time, real_sender_id, message_content, source, WCDB_CT_message_content)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (local_id, server_id, local_type, create_time, real_sender_id, message_content, source, WCDB_CT_message_content, WCDB_CT_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                (1, 111, 3, 1722858000, 0, "[图片]", "", 0),
-                (2, 222, 34, 1722858001, 0, "[语音]", "", 0),
+                (1, 111, 3, 1722858000, 0, "[图片]", "", 0, 0),
+                (2, 222, 34, 1722858001, 0, "[语音]", "", 0, 0),
             ],
         )
         conn.commit()
@@ -159,19 +162,23 @@ class SingleSessionMediaExportTests(unittest.TestCase):
         create_time,
         message_content,
         source,
+        source_compression_type=0,
     ):
         message_db = self.decrypted_dir / "message" / "message_0.db"
         conn = sqlite3.connect(message_db)
         conn.execute(
             f"""
             INSERT INTO {session_table_for_username(self.contact_username)}
-            (local_id, server_id, local_type, create_time, real_sender_id, message_content, source, WCDB_CT_message_content)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (local_id, server_id, local_type, create_time, real_sender_id, message_content, source, WCDB_CT_message_content, WCDB_CT_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (local_id, server_id, local_type, create_time, 0, message_content, source, 0),
+            (local_id, server_id, local_type, create_time, 0, message_content, source, 0, source_compression_type),
         )
         conn.commit()
         conn.close()
+
+    def _compress_source(self, text):
+        return zstandard.ZstdCompressor().compress(text.encode("utf-8"))
 
     def _create_media_db(self, voice_rows):
         media_db = self.decrypted_dir / "message" / "media_0.db"
@@ -491,6 +498,34 @@ class SingleSessionMediaExportTests(unittest.TestCase):
         self.assertEqual(text_message.get("mentions"), [{"wxid": "wxid_alice"}, {"wxid": "wxid_bob"}])
         self.assertEqual(text_message.get("content"), "@alice @bob hello")
         self.assertNotIn("_source", text_message)
+
+    def test_export_single_session_json_adds_mentions_for_zstd_source_metadata(self):
+        compressed_source = self._compress_source(
+            "<msgsource><atuserlist>wxid_alice,wxid_bob,wxid_alice</atuserlist></msgsource>"
+        )
+        self._insert_session_message_row(
+            local_id=5,
+            server_id=555,
+            local_type=1,
+            create_time=1722858004,
+            message_content="@alice @bob compressed",
+            source=compressed_source,
+            source_compression_type=4,
+        )
+
+        with patch("chat_export.try_convert_silk_bytes_to_wav", return_value=b"RIFFmock-wav", create=True):
+            export_single_session(
+                decrypted_dir=str(self.decrypted_dir),
+                contact_username=self.contact_username,
+                contact_display_name="好友",
+                output_dir=str(self.output_dir),
+                owner_id="wxid_owner",
+                printer=lambda *_args, **_kwargs: None,
+            )
+
+        payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
+        text_message = next(message for message in payload if message.get("content") == "@alice @bob compressed")
+        self.assertEqual(text_message.get("mentions"), [{"wxid": "wxid_alice"}, {"wxid": "wxid_bob"}])
 
     def test_export_single_session_json_does_not_add_mentions_when_atuserlist_missing_or_empty(self):
         self._insert_session_message_row(
