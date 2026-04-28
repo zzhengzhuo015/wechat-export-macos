@@ -7,7 +7,11 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
+import zstandard
+
 from chat_export import (
+    _attach_mentions_to_message,
+    _extract_mentions_from_source,
     _infer_media_kind_from_path,
     build_chatlab_payload,
     dedupe_filename,
@@ -131,23 +135,50 @@ class SingleSessionMediaExportTests(unittest.TestCase):
                 real_sender_id INTEGER,
                 message_content BLOB,
                 source TEXT,
-                WCDB_CT_message_content INTEGER
+                WCDB_CT_message_content INTEGER,
+                WCDB_CT_source INTEGER
             )
             """
         )
         conn.executemany(
             f"""
             INSERT INTO {session_table_for_username(self.contact_username)}
-            (local_id, server_id, local_type, create_time, real_sender_id, message_content, source, WCDB_CT_message_content)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (local_id, server_id, local_type, create_time, real_sender_id, message_content, source, WCDB_CT_message_content, WCDB_CT_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                (1, 111, 3, 1722858000, 0, "[图片]", "", 0),
-                (2, 222, 34, 1722858001, 0, "[语音]", "", 0),
+                (1, 111, 3, 1722858000, 0, "[图片]", "", 0, 0),
+                (2, 222, 34, 1722858001, 0, "[语音]", "", 0, 0),
             ],
         )
         conn.commit()
         conn.close()
+
+    def _insert_session_message_row(
+        self,
+        local_id,
+        server_id,
+        local_type,
+        create_time,
+        message_content,
+        source,
+        source_compression_type=0,
+    ):
+        message_db = self.decrypted_dir / "message" / "message_0.db"
+        conn = sqlite3.connect(message_db)
+        conn.execute(
+            f"""
+            INSERT INTO {session_table_for_username(self.contact_username)}
+            (local_id, server_id, local_type, create_time, real_sender_id, message_content, source, WCDB_CT_message_content, WCDB_CT_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (local_id, server_id, local_type, create_time, 0, message_content, source, 0, source_compression_type),
+        )
+        conn.commit()
+        conn.close()
+
+    def _compress_source(self, text):
+        return zstandard.ZstdCompressor().compress(text.encode("utf-8"))
 
     def _create_media_db(self, voice_rows):
         media_db = self.decrypted_dir / "message" / "media_0.db"
@@ -442,6 +473,197 @@ class SingleSessionMediaExportTests(unittest.TestCase):
         self.assertEqual(payload[0]["file_path"], f"images/{self.session_hash}/1_1722858000.jpg")
         self.assertTrue((self.output_dir / payload[0]["file_path"]).exists())
 
+    def test_export_single_session_json_adds_mentions_for_text_message_source_metadata(self):
+        self._insert_session_message_row(
+            local_id=3,
+            server_id=333,
+            local_type=1,
+            create_time=1722858002,
+            message_content="@alice @bob hello",
+            source="<msgsource><atuserlist>wxid_alice,wxid_bob</atuserlist></msgsource>",
+        )
+
+        with patch("chat_export.try_convert_silk_bytes_to_wav", return_value=b"RIFFmock-wav", create=True):
+            export_single_session(
+                decrypted_dir=str(self.decrypted_dir),
+                contact_username=self.contact_username,
+                contact_display_name="好友",
+                output_dir=str(self.output_dir),
+                owner_id="wxid_owner",
+                printer=lambda *_args, **_kwargs: None,
+            )
+
+        payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
+        text_message = next(message for message in payload if message.get("content") == "@alice @bob hello")
+        self.assertEqual(
+            text_message.get("mentions"),
+            [
+                {"wxid": "wxid_alice", "text": "@alice", "start": 0, "end": 6},
+                {"wxid": "wxid_bob", "text": "@bob", "start": 7, "end": 11},
+            ],
+        )
+        self.assertEqual(text_message.get("content"), "@alice @bob hello")
+        self.assertNotIn("_source", text_message)
+
+    def test_export_single_session_json_adds_mentions_for_zstd_source_metadata(self):
+        compressed_source = self._compress_source(
+            "<msgsource><atuserlist>wxid_alice,wxid_bob,wxid_alice</atuserlist></msgsource>"
+        )
+        self._insert_session_message_row(
+            local_id=5,
+            server_id=555,
+            local_type=1,
+            create_time=1722858004,
+            message_content="@alice @bob compressed",
+            source=compressed_source,
+            source_compression_type=4,
+        )
+
+        with patch("chat_export.try_convert_silk_bytes_to_wav", return_value=b"RIFFmock-wav", create=True):
+            export_single_session(
+                decrypted_dir=str(self.decrypted_dir),
+                contact_username=self.contact_username,
+                contact_display_name="好友",
+                output_dir=str(self.output_dir),
+                owner_id="wxid_owner",
+                printer=lambda *_args, **_kwargs: None,
+            )
+
+        payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
+        text_message = next(message for message in payload if message.get("content") == "@alice @bob compressed")
+        self.assertEqual(
+            text_message.get("mentions"),
+            [
+                {"wxid": "wxid_alice", "text": "@alice", "start": 0, "end": 6},
+                {"wxid": "wxid_bob", "text": "@bob", "start": 7, "end": 11},
+            ],
+        )
+
+    def test_export_single_session_json_maps_mentions_to_text_segments(self):
+        self._insert_session_message_row(
+            local_id=6,
+            server_id=666,
+            local_type=1,
+            create_time=1722858005,
+            message_content="@史迪仔\u2005 测试@的",
+            source="<msgsource><atuserlist>wxid_stitch</atuserlist></msgsource>",
+        )
+
+        with patch("chat_export.try_convert_silk_bytes_to_wav", return_value=b"RIFFmock-wav", create=True):
+            export_single_session(
+                decrypted_dir=str(self.decrypted_dir),
+                contact_username=self.contact_username,
+                contact_display_name="好友",
+                output_dir=str(self.output_dir),
+                owner_id="wxid_owner",
+                printer=lambda *_args, **_kwargs: None,
+            )
+
+        payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
+        text_message = next(message for message in payload if message.get("content") == "@史迪仔\u2005 测试@的")
+        self.assertEqual(
+            text_message.get("mentions"),
+            [{"wxid": "wxid_stitch", "text": "@史迪仔", "start": 0, "end": 4}],
+        )
+
+    def test_export_single_session_json_does_not_add_mentions_when_atuserlist_missing_or_empty(self):
+        self._insert_session_message_row(
+            local_id=3,
+            server_id=333,
+            local_type=1,
+            create_time=1722858002,
+            message_content="@alice empty-atuserlist",
+            source="<msgsource><atuserlist> </atuserlist></msgsource>",
+        )
+        self._insert_session_message_row(
+            local_id=4,
+            server_id=444,
+            local_type=1,
+            create_time=1722858003,
+            message_content="@alice missing-atuserlist-tag",
+            source="<msgsource></msgsource>",
+        )
+
+        with patch("chat_export.try_convert_silk_bytes_to_wav", return_value=b"RIFFmock-wav", create=True):
+            export_single_session(
+                decrypted_dir=str(self.decrypted_dir),
+                contact_username=self.contact_username,
+                contact_display_name="好友",
+                output_dir=str(self.output_dir),
+                owner_id="wxid_owner",
+                printer=lambda *_args, **_kwargs: None,
+            )
+
+        payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
+        empty_list_message = next(
+            message for message in payload if message.get("content") == "@alice empty-atuserlist"
+        )
+        missing_tag_message = next(
+            message for message in payload if message.get("content") == "@alice missing-atuserlist-tag"
+        )
+        self.assertNotIn("mentions", empty_list_message)
+        self.assertNotIn("_source", empty_list_message)
+        self.assertNotIn("mentions", missing_tag_message)
+        self.assertNotIn("_source", missing_tag_message)
+
+
+class SingleSessionSchemaCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp_dir.name)
+        self.decrypted_dir = self.base / "decrypted"
+        self.output_dir = self.base / "output"
+        (self.decrypted_dir / "message").mkdir(parents=True, exist_ok=True)
+        self.contact_username = "wxid_friend"
+        self._create_message_db_without_source()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _create_message_db_without_source(self):
+        message_db = self.decrypted_dir / "message" / "message_0.db"
+        conn = sqlite3.connect(message_db)
+        conn.execute("CREATE TABLE Name2Id (rowid INTEGER PRIMARY KEY, user_name TEXT)")
+        conn.execute(
+            f"""
+            CREATE TABLE {session_table_for_username(self.contact_username)} (
+                local_id INTEGER,
+                server_id INTEGER,
+                local_type INTEGER,
+                create_time INTEGER,
+                real_sender_id INTEGER,
+                message_content BLOB,
+                WCDB_CT_message_content INTEGER
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            INSERT INTO {session_table_for_username(self.contact_username)}
+            (local_id, server_id, local_type, create_time, real_sender_id, message_content, WCDB_CT_message_content)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, 111, 1, 1722858000, 0, "hello without source column", 0),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_export_single_session_succeeds_when_source_column_missing(self):
+        exported_count = export_single_session(
+            decrypted_dir=str(self.decrypted_dir),
+            contact_username=self.contact_username,
+            contact_display_name="好友",
+            output_dir=str(self.output_dir),
+            owner_id="wxid_owner",
+            printer=lambda *_args, **_kwargs: None,
+        )
+
+        self.assertEqual(exported_count, 1)
+        payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["content"], "hello without source column")
+        self.assertNotIn("mentions", payload[0])
+
 
 class MediaPathInferenceTests(unittest.TestCase):
     def test_infer_media_kind_prefers_directory_segments_and_suffixes(self):
@@ -457,6 +679,93 @@ class MediaPathInferenceTests(unittest.TestCase):
         heic_path = Path("/tmp/attach/session/2024-08/Img/1_2.heic")
 
         self.assertIsNone(_infer_media_kind_from_path(heic_path))
+
+
+class MentionParserTests(unittest.TestCase):
+    def test_extract_mentions_from_source_reads_atuserlist_in_order(self):
+        source = "<msgsource><atuserlist>wxid_alice,wxid_bob,wxid_carol</atuserlist></msgsource>"
+
+        mentions = _extract_mentions_from_source(source)
+
+        self.assertEqual(
+            mentions,
+            [{"wxid": "wxid_alice"}, {"wxid": "wxid_bob"}, {"wxid": "wxid_carol"}],
+        )
+
+    def test_extract_mentions_from_source_dedupes_and_unescapes_xml(self):
+        escaped_source = (
+            "&lt;msgsource&gt;&lt;atuserlist&gt;"
+            "wxid_alice,wxid_alice,wxid_bob,wxid_alice,wxid_carol,wxid_bob"
+            "&lt;/atuserlist&gt;&lt;/msgsource&gt;"
+        )
+
+        mentions = _extract_mentions_from_source(escaped_source)
+
+        self.assertEqual(
+            mentions,
+            [{"wxid": "wxid_alice"}, {"wxid": "wxid_bob"}, {"wxid": "wxid_carol"}],
+        )
+
+    def test_extract_mentions_from_source_reads_bytes_and_case_insensitive_tag(self):
+        source_bytes = b"<msgsource><ATUSERLIST>wxid_alice,wxid_bob,wxid_alice</ATUSERLIST></msgsource>"
+
+        mentions = _extract_mentions_from_source(source_bytes)
+
+        self.assertEqual(
+            mentions,
+            [{"wxid": "wxid_alice"}, {"wxid": "wxid_bob"}],
+        )
+
+    def test_attach_mentions_to_message_ignores_non_text_and_missing_source(self):
+        non_text_message = {"_raw_type": 3, "content": "[图片]"}
+        _attach_mentions_to_message(
+            non_text_message,
+            "<msgsource><atuserlist>wxid_alice</atuserlist></msgsource>",
+        )
+        self.assertNotIn("mentions", non_text_message)
+
+        text_message_without_source = {"_raw_type": 1, "content": "hello"}
+        _attach_mentions_to_message(text_message_without_source, None)
+        self.assertNotIn("mentions", text_message_without_source)
+
+    def test_attach_mentions_to_message_adds_mentions_for_text_message(self):
+        text_message = {"_raw_type": 1, "content": "@all hello"}
+
+        _attach_mentions_to_message(
+            text_message,
+            "<msgsource><atuserlist>wxid_alice,wxid_bob,wxid_alice</atuserlist></msgsource>",
+        )
+
+        self.assertEqual(
+            text_message.get("mentions"),
+            [
+                {"wxid": "wxid_alice", "text": "@all", "start": 0, "end": 4},
+                {"wxid": "wxid_bob"},
+            ],
+        )
+
+    def test_attach_mentions_to_message_preserves_existing_mentions(self):
+        text_message = {"_raw_type": 1, "content": "hello", "mentions": [{"wxid": "wxid_existing"}]}
+
+        _attach_mentions_to_message(
+            text_message,
+            "<msgsource><atuserlist>wxid_alice,wxid_bob</atuserlist></msgsource>",
+        )
+
+        self.assertEqual(text_message["mentions"], [{"wxid": "wxid_existing"}])
+
+    def test_attach_mentions_to_message_ignores_plain_text_at_symbols(self):
+        text_message = {"_raw_type": 1, "content": "@史迪仔\u2005 测试@的"}
+
+        _attach_mentions_to_message(
+            text_message,
+            "<msgsource><atuserlist>wxid_stitch</atuserlist></msgsource>",
+        )
+
+        self.assertEqual(
+            text_message["mentions"],
+            [{"wxid": "wxid_stitch", "text": "@史迪仔", "start": 0, "end": 4}],
+        )
 
 
 if __name__ == "__main__":
