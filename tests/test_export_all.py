@@ -401,7 +401,10 @@ class ExportAllSessionsTests(unittest.TestCase):
         self.assertEqual(payload["messages"][0]["content"], "你好")
         self.assertEqual(
             payload["messages"][0]["mentions"],
-            [{"wxid": "wxid_friend"}, {"wxid": "wxid_owner"}],
+            [
+                {"wxid": "wxid_friend"},
+                {"wxid": "wxid_owner"},
+            ],
         )
         self.assertNotIn("_source", payload["messages"][0])
 
@@ -469,7 +472,10 @@ class ExportAllSessionsTests(unittest.TestCase):
         )
 
         payload = json.loads((self.output_dir / "转义来源.json").read_text(encoding="utf-8"))
-        self.assertEqual(payload["messages"][0]["mentions"], [{"wxid": "wxid_friend"}, {"wxid": "wxid_owner"}])
+        self.assertEqual(
+            payload["messages"][0]["mentions"],
+            [{"wxid": "wxid_friend"}, {"wxid": "wxid_owner"}],
+        )
 
     def test_export_all_sessions_parses_mentions_from_zstd_source(self):
         compressed_source_username = "wxid_zstd_source"
@@ -495,7 +501,33 @@ class ExportAllSessionsTests(unittest.TestCase):
         payload = json.loads((self.output_dir / "压缩来源.json").read_text(encoding="utf-8"))
         self.assertEqual(
             payload["messages"][0]["mentions"],
-            [{"wxid": "wxid_friend"}, {"wxid": "wxid_owner"}],
+            [
+                {"wxid": "wxid_friend", "text": "@friend", "start": 0, "end": 7},
+                {"wxid": "wxid_owner"},
+            ],
+        )
+
+    def test_export_all_sessions_maps_mentions_to_text_segments_when_detectable(self):
+        mapped_username = "wxid_mapped"
+        mapped_table = session_table_for_username(mapped_username)
+        self._insert_contact(mapped_username, nick_name="映射来源")
+        self._create_session_table(mapped_table, include_source=True)
+        self._insert_message(
+            mapped_table,
+            (13, 0, 1, 1722859100, 2, "@史迪仔\u2005 测试@的"),
+            source="<msgsource><atuserlist>wxid_stitch</atuserlist></msgsource>",
+        )
+
+        export_all_sessions(
+            str(self.decrypted_dir),
+            str(self.output_dir),
+            owner_id="wxid_owner",
+        )
+
+        payload = json.loads((self.output_dir / "映射来源.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["messages"][0]["mentions"],
+            [{"wxid": "wxid_stitch", "text": "@史迪仔", "start": 0, "end": 4}],
         )
 
 

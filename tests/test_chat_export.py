@@ -495,7 +495,13 @@ class SingleSessionMediaExportTests(unittest.TestCase):
 
         payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
         text_message = next(message for message in payload if message.get("content") == "@alice @bob hello")
-        self.assertEqual(text_message.get("mentions"), [{"wxid": "wxid_alice"}, {"wxid": "wxid_bob"}])
+        self.assertEqual(
+            text_message.get("mentions"),
+            [
+                {"wxid": "wxid_alice", "text": "@alice", "start": 0, "end": 6},
+                {"wxid": "wxid_bob", "text": "@bob", "start": 7, "end": 11},
+            ],
+        )
         self.assertEqual(text_message.get("content"), "@alice @bob hello")
         self.assertNotIn("_source", text_message)
 
@@ -525,7 +531,40 @@ class SingleSessionMediaExportTests(unittest.TestCase):
 
         payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
         text_message = next(message for message in payload if message.get("content") == "@alice @bob compressed")
-        self.assertEqual(text_message.get("mentions"), [{"wxid": "wxid_alice"}, {"wxid": "wxid_bob"}])
+        self.assertEqual(
+            text_message.get("mentions"),
+            [
+                {"wxid": "wxid_alice", "text": "@alice", "start": 0, "end": 6},
+                {"wxid": "wxid_bob", "text": "@bob", "start": 7, "end": 11},
+            ],
+        )
+
+    def test_export_single_session_json_maps_mentions_to_text_segments(self):
+        self._insert_session_message_row(
+            local_id=6,
+            server_id=666,
+            local_type=1,
+            create_time=1722858005,
+            message_content="@史迪仔\u2005 测试@的",
+            source="<msgsource><atuserlist>wxid_stitch</atuserlist></msgsource>",
+        )
+
+        with patch("chat_export.try_convert_silk_bytes_to_wav", return_value=b"RIFFmock-wav", create=True):
+            export_single_session(
+                decrypted_dir=str(self.decrypted_dir),
+                contact_username=self.contact_username,
+                contact_display_name="好友",
+                output_dir=str(self.output_dir),
+                owner_id="wxid_owner",
+                printer=lambda *_args, **_kwargs: None,
+            )
+
+        payload = json.loads((self.output_dir / "chat.json").read_text(encoding="utf-8"))
+        text_message = next(message for message in payload if message.get("content") == "@史迪仔\u2005 测试@的")
+        self.assertEqual(
+            text_message.get("mentions"),
+            [{"wxid": "wxid_stitch", "text": "@史迪仔", "start": 0, "end": 4}],
+        )
 
     def test_export_single_session_json_does_not_add_mentions_when_atuserlist_missing_or_empty(self):
         self._insert_session_message_row(
@@ -699,7 +738,10 @@ class MentionParserTests(unittest.TestCase):
 
         self.assertEqual(
             text_message.get("mentions"),
-            [{"wxid": "wxid_alice"}, {"wxid": "wxid_bob"}],
+            [
+                {"wxid": "wxid_alice", "text": "@all", "start": 0, "end": 4},
+                {"wxid": "wxid_bob"},
+            ],
         )
 
     def test_attach_mentions_to_message_preserves_existing_mentions(self):
@@ -711,6 +753,19 @@ class MentionParserTests(unittest.TestCase):
         )
 
         self.assertEqual(text_message["mentions"], [{"wxid": "wxid_existing"}])
+
+    def test_attach_mentions_to_message_ignores_plain_text_at_symbols(self):
+        text_message = {"_raw_type": 1, "content": "@史迪仔\u2005 测试@的"}
+
+        _attach_mentions_to_message(
+            text_message,
+            "<msgsource><atuserlist>wxid_stitch</atuserlist></msgsource>",
+        )
+
+        self.assertEqual(
+            text_message["mentions"],
+            [{"wxid": "wxid_stitch", "text": "@史迪仔", "start": 0, "end": 4}],
+        )
 
 
 if __name__ == "__main__":

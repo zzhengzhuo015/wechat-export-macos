@@ -292,6 +292,22 @@ def _extract_mentions_from_source(source):
     return [{"wxid": wxid} for wxid in ordered_ids]
 
 
+def _extract_mention_spans_from_content(content):
+    if not isinstance(content, str) or not content:
+        return []
+
+    spans = []
+    for match in re.finditer(r"(?<!\S)@[^\s@]+", content):
+        spans.append(
+            {
+                "text": match.group(0),
+                "start": match.start(),
+                "end": match.end(),
+            }
+        )
+    return spans
+
+
 def _decode_source_value(source, compression_type):
     if source is None:
         return None
@@ -312,6 +328,10 @@ def _attach_mentions_to_message(message, source):
         return
     mentions = _extract_mentions_from_source(source)
     if mentions:
+        mention_spans = _extract_mention_spans_from_content(message.get("content", ""))
+        for index, mention in enumerate(mentions):
+            if index < len(mention_spans):
+                mention.update(mention_spans[index])
         message["mentions"] = mentions
 
 
